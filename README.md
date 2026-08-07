@@ -50,20 +50,14 @@ Each inferred simplex `s` is a claim that the hyperedges nested inside
 it are better explained as noisy observations of one latent group
 interaction on `s`'s nodes than as independent interactions. The
 compression ratio `eta` in (0, 1] summarizes how much simplicial
-structure the data contain (lower = more); `eta = 1` means the method
-found no evidence of simplicial structure and returned the null
-decomposition — the method abstains rather than hallucinating structure
-on random data.
+structure the data contain (lower = more).
 
 ## Scaling
 
 The file includes the paper's three resource budgets (a per-node
 candidate-pair budget, a per-object candidate budget, and a memory
 bound under which candidate seeding switches to a MinHash-LSH
-generator, implemented in numpy). None of them engage on small or
-moderate data; with them the method has been run on hypergraphs with
-10^6 hyperedges. All budgets can only omit candidate merges, never
-apply an unsound one.
+generator, implemented in numpy), allowing for easy scalability to very large systems 
 
 ## Citing
 
