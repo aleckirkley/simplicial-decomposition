@@ -6,10 +6,6 @@ parsimoniously described as fragments of coherent group interactions —
 and a **residual** of independent hyperedges. The method minimizes a
 description length derived from a Bayesian generative model.
 
-Companion code for:
-
-> A. Kirkley and F. Battiston, *When are hypergraphs simplicial?* (2026). [journal / arXiv link]
-
 ## Contents
 
 - `simplicial_decomposition.py` — the complete algorithm for running the decomposition.
