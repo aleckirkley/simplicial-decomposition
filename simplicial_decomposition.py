@@ -11,20 +11,15 @@ generative model):
            + sum_{h in H} log2 C(N, n(h)),                           (residual)
 
 where n(.) counts nodes, N is the number of nodes in the system, and
-F(s) is the set of observed hyperedges hosted by simplex s (each
-hyperedge is hosted by its smallest enclosing simplex; a simplex's own
-top face, when observed, is hosted at zero cost). The decomposition is
-found with the two-phase greedy algorithm of the paper: a bottom-up
-collapse of the nestedness DAG (Phase 1) followed by best-first merging
-of overlapping objects with exact description-length deltas (Phase 2).
+F(s) is the set of observed hyperedges hosted by simplex s. The decomposition is
+found with the two-phase greedy algorithm of the paper, consisting of a bottom-up
+collapse of the nestedness DAG (Phase 1) followed by greedy merging
+of overlapping objects (Phase 2).
 
-This file is extracted verbatim from the code used to produce every
-result in the paper (only plotting, corpus-management, and unit-test
-machinery are omitted), so it reproduces the paper's outputs exactly,
-including the three resource budgets used on very large corpora (a
+This code includes the three resource budgets for scalability to very large networks (a
 per-node candidate-pair budget, a per-object candidate budget, and a
 memory bound under which candidate seeding switches to a MinHash-LSH
-generator; none of them engage on small or moderate data).
+generator).
 
 Quick start:
 
@@ -35,9 +30,6 @@ Quick start:
     result['eta']    # compression ratio L / L0 (1.0 = no simplicial structure)
 
 Dependencies: numpy. (Python >= 3.9.)
-
-Reference: A. Kirkley and F. Battiston, "Finding noisy simplices in
-complex systems" (2026). Please cite the paper if you use this code.
 """
 
 import heapq
@@ -92,8 +84,7 @@ def logchoose(n,k):
 
 
 def _logchoose(n, k):
-    """log2 C(n, k). Cached: (n, k) pairs repeat heavily across edges of the
-    same size, so memoizing avoids recomputing loggamma calls."""
+    """log2 C(n, k)"""
     if k < 0 or k > n:
         return float('inf')
     return logchoose(n, k) / math.log(2)
@@ -102,32 +93,13 @@ def _logchoose(n, k):
 def _enclosing_key(s):
     """Canonical tie-break key for selecting the smallest enclosing simplex:
     size first, then lexicographic on the sorted node tuple. Guarantees a
-    deterministic choice whenever multiple candidates in S have equal size
-    (ties do not affect L -- see SI Eq. assignment -- but an implementation
-    must still commit to *some* fixed rule for reproducibility)."""
+    deterministic choice whenever multiple candidates in S have equal size."""
     return (len(s), tuple(sorted(s)))
 
 
 def _assign_faces(G_frozen, S):
     """Assign each edge in G_frozen to its smallest enclosing simplex in S
-    (ties broken via _enclosing_key), matching the SI's assignment rule.
-    Returns (faces_assigned, covered) with the same contents as the naive
-
-        faces_assigned = {s: [] for s in S}
-        covered = set()
-        for e in G_frozen:
-            covering = [s for s in S if e <= s]
-            if covering:
-                best = min(covering, key=_enclosing_key)
-                faces_assigned[best].append(e)
-                covered.add(e)
-
-    but found via a node -> simplices-of-S index, so each edge only checks
-    the (small) set of simplices incident to *every* one of its nodes --
-    the true candidates for e <= s -- instead of scanning all of S. This
-    turns an O(E*|S|) full scan into O(E * degree-in-S), which matters
-    once |S| is large (e.g. right after phase 1, before phase 2 has had a
-    chance to shrink it, or for corpora with tens of thousands of edges).
+    (ties broken via _enclosing_key)
     """
     faces_assigned = {s: [] for s in S}
     covered = set()
@@ -156,13 +128,7 @@ def _assign_faces(G_frozen, S):
 
 
 def description_length(G_frozen, S, N):
-    """L(S, H) -- Eq. (L): node-set + face-encoding cost for simplices in S,
-    plus isolation cost for the residual H = G \\ (faces covered by S).
-
-    Each G-face is assigned to its smallest enclosing simplex (ties broken
-    deterministically via _enclosing_key), matching the SI's assignment
-    rule (Eq. assignment).
-    """
+    """Computes full description length objective L(S, H)."""
     S = list(S)
     faces_assigned, covered = _assign_faces(G_frozen, S)
     H = G_frozen - covered
@@ -171,25 +137,19 @@ def description_length(G_frozen, S, N):
                 for s in S))
     if _size_prior_on():
         # geometric size prior: n(s) bits per non-singleton simplex.
-        # (Hyperedge sizes cancel against the null and are never added;
-        # singletons are charged as isolated edges, consistent with the
-        # greedy's internal accounting and with _finalise moving them to
-        # H -- under this prior that move is strictly optimal.)
         dl += sum(len(s) for s in S if set(faces_assigned[s]) != {s})
     return dl
 
 
 def baseline_DL(G_frozen, N):
     """L0: description length when every edge is isolated (no simplices,
-    S = empty set). This is the null model compared against throughout."""
+    S = empty set)"""
     return sum(_logchoose(N, len(e)) for e in G_frozen)
 
 
 def _finalise(G_frozen, S, DL, L0):
-    """Drop neutral singletons (A(s) = {s}: costs exactly the same as
-    leaving s in H, so they represent no real compression), then return
-    (S, H, DL, eta). Uses the same lexicographic tie-break as
-    description_length so the returned partition is deterministic."""
+    """Drop neutral singletons (A(s) = {s}), then return
+    (S, H, DL, eta)."""
     faces_assigned, _ = _assign_faces(G_frozen, S)
     S = [s for s in S if set(faces_assigned[s]) != {s}]
     _, covered = _assign_faces(G_frozen, S)
@@ -201,16 +161,6 @@ def _build_nestedness_dag(G_list):
     """Return child -> set-of-direct-parents in the nestedness partial order
     (h1 -> h2 when h1 is a proper subset of h2, with no intermediate
     hyperedge in G).
-
-    h2 can only be a superset of h1 if h2 is incident to *every* node of
-    h1, so the candidate supersets of h1 are exactly the intersection of
-    the incident-edge sets of h1's nodes (via a node -> incident-edges
-    index built once, up front). This replaces an O(E^2) all-pairs subset
-    scan with a cost proportional to node degrees, which is what actually
-    matters on sparse empirical hypergraphs where E can be in the
-    millions but per-node degree is orders of magnitude smaller. The
-    final Hasse reduction (dropping non-direct parents) is unchanged and
-    stays cheap since each hyperedge's candidate-parent set is now small.
     """
     node_index = defaultdict(set)
     for h in G_list:
@@ -229,14 +179,7 @@ def _build_nestedness_dag(G_list):
         candidates.discard(h1)
         parents[h1] = {h2 for h2 in candidates if h1 < h2}
 
-    # Hasse reduction: keep only the minimal parents under the subset order.
-    # Processing candidates in ascending size and testing each only against
-    # the already-kept minimal set is exact (if p is dominated by some
-    # non-minimal q < p, transitivity gives a kept r < q < p that also
-    # dominates p) and costs O(|pars| * |direct|) per child instead of the
-    # previous all-pairs O(|pars|^2) -- the difference matters on heavily
-    # nested corpora where a small hyperedge can have hundreds of parents
-    # but only a handful of direct ones.
+    # Hasse reduction: keep only the minimal parents under the subset order. 
     direct = {}
     for child, pars in parents.items():
         kept = []
@@ -248,26 +191,16 @@ def _build_nestedness_dag(G_list):
 
 
 def phase1(G_frozen, N, logfile=None):
-    """Bottom-up DAG collapse (Eq. delta-dag): absorb each edge into
+    """Bottom-up DAG collapse, absorbing each edge into
     whichever direct parent yields the most-negative re-encoding gain.
-
     Parents are iterated in a fixed deterministic order (size, then sorted
     node tuple), and all viable parents are evaluated before committing to
-    the one with the smallest delta, so the result is independent of
-    Python's set/dict iteration order.
+    the one with the smallest delta.
     """
     G_list = list(G_frozen)
     sfm = {h: frozenset({h}) for h in G_list}
     dag = _build_nestedness_dag(G_list)
-    # Per-simplex face-SIZE histograms: the absorption delta only depends on
-    # the sizes of the already-absorbed faces, so summing over the histogram
-    # (a handful of distinct sizes) instead of over every face is exact and
-    # turns the per-parent evaluation cost from O(|A(h)|) into O(k).
-    # Identity used (equivalent to the original explicit sum):
-    #   delta = sum_j hist_h[j] * [logC(n_par, j) - logC(n_h, j)]
-    #           - logC(N, n_h)
-    # (the e = h term of the histogram sum contributes exactly the original
-    # leading +logC(n_par, n_h), since logC(n_h, n_h) = 0).
+    # Per-simplex face-SIZE histograms
     hist = {h: Counter((len(h),)) for h in G_list}
     _sp = _size_prior_on()
     for h in sorted(G_list, key=_enclosing_key):
@@ -309,48 +242,7 @@ def phase2(simplex_faces_map, G_frozen, N, logfile=None,
            lsh_num_perm=None, lsh_threshold=None,
            stochastic_eps=0.0, theta=0.0, budget_s=None,
            node_pair_cap=None):
-    """Intersection-graph greedy merges via min-heap (SI "Phase 2").
-
-    hub_cap / lsh_num_perm / lsh_threshold left at None resolve to the
-    module-level resource constants, so direct callers get the same
-    configuration as greedy_optimizer.
-
-    2026-07-18 rework (exact -- same merge criterion and same outputs as
-    the direct implementation, up to floating-point summation order):
-    the per-candidate-pair merge delta used to be recomputed from scratch
-    by enumerating every hyperedge nested in the pair's union, which costs
-    O(|G|) per evaluation once a growing simplex covers a large fraction
-    of the nodes; profiling showed >95% of wall-clock time there on
-    corpora that grow giant simplices. The rework maintains, per current
-    simplex s:
-
-      nested[s]   every G-edge contained in s (complete by construction:
-                  for a merge-born union u = s1 | s2, an edge e <= u
-                  satisfies e <= s1, e <= s2, or e meets both s1\s2 and
-                  s2\s1 -- an exact decomposition -- so
-                  nested[u] = nested[s1] | nested[s2] | cross(s1,s2),
-                  with cross() enumerable from the incident edges of the
-                  SMALLER node-difference only)
-      owned[s]    A(s) as before (phase-1 absorptions; for merge-born
-                  simplices owned == nested, matching the previous
-                  behavior of assigning a union every edge nested in it)
-      size histograms and three cached cost sums per simplex
-                  (sum logC(N, n(e)) over nested and over owned, and
-                  sum logC(n(s), n(e)) over owned)
-
-    from which the exact pairwise delta of Eq. (delta-ss) -- including the
-    documented "spanning" approximation, unchanged -- is assembled in
-    O(k + |shared| + |cross|) time, where shared/cross are enumerated via
-    the smaller of the two operands. Set unions steal the larger operand
-    (union-find style), so the total maintenance cost over a sequence of
-    merges is near-linear rather than quadratic in the giant simplex's
-    face count. Heap bookkeeping, push order, and tie handling are kept
-    byte-identical to the previous implementation, so the only possible
-    output differences are floating-point summation-order effects on
-    exactly tied merge deltas (rare, symmetric-structure cases; verified
-    at ~1 in 50 synthetic stress instances, with either choice a valid
-    greedy step).
-    """
+    """Intersection-graph greedy merges via min-heap ("Phase 2")."""
     if hub_cap is None:
         hub_cap = HUB_CAP
     if lsh_num_perm is None:
@@ -367,11 +259,7 @@ def phase2(simplex_faces_map, G_frozen, N, logfile=None,
             edge_index[v].add(e)
     deg = {v: len(es) for v, es in edge_index.items()}
     kmax = max((len(e) for e in G_frozen), default=0)
-    # per-node allowance for the cross-edge charge: any cross edge of the
-    # pair (s1, s2) is incident to the smaller node-difference, and each
-    # contributes at most logC(N, n(e)) to the delta's spanning charge, so
-    # sum_{v in diff} nodeCrossN[v] soundly upper-bounds the total cross
-    # contribution (used to prune pairs before enumerating cross edges).
+    # per-node allowance for the cross-edge charge
     nodeCrossN = {v: sum(_logchoose(N, len(e)) for e in es)
                   for v, es in edge_index.items()}
 
