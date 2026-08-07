@@ -13,9 +13,7 @@ Companion code for:
 
 ## Contents
 
-- `simplicial_decomposition.py` — the complete algorithm in one file,
-  extracted verbatim from the code used for every result in the paper.
-  Only `numpy` is required.
+- `simplicial_decomposition.py` — the complete algorithm for running the decomposition.
 - `reproduce_fig1.py` — reproduces the paper's Fig. 1 example:
   decomposes a small synthetic hypergraph and prints the observed
   hypergraph, the inferred simplices with their hosted hyperedges, the
