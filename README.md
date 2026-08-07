@@ -4,8 +4,7 @@ Parameter-free decomposition of a hypergraph into its **simplicial
 component** — a set of latent simplices whose observed faces are more
 parsimoniously described as fragments of coherent group interactions —
 and a **residual** of independent hyperedges. The method minimizes a
-description length derived from a Bayesian generative model (equivalently,
-performs maximum-a-posteriori inference) and has no tunable parameters.
+description length derived from a Bayesian generative model.
 
 Companion code for:
 
