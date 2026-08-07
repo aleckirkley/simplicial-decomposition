@@ -8,8 +8,7 @@ description length derived from a Bayesian generative model.
 
 Companion code for:
 
-> A. Kirkley and F. Battiston, *Finding noisy simplices in complex
-> systems* (2026). [journal / arXiv link]
+> A. Kirkley and F. Battiston, *When are hypergraphs simplicial?* (2026). [journal / arXiv link]
 
 ## Contents
 
