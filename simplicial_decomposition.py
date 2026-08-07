@@ -273,9 +273,7 @@ def phase2(simplex_faces_map, G_frozen, N, logfile=None,
     degsum = {}       # simplex -> sum of node degrees (for the cross bound)
     sxc = {}          # simplex -> sum of nodeCrossN over the simplex's nodes
 
-    # node -> live simplices index, built first so the nested-set
-    # initialization below can use the inverted rarest-node scan. Kept
-    # incrementally maintained through merges (see the merge block).
+    # node -> live simplices index; maintained incrementally through merges
     simplex_index = defaultdict(set)
     for s in simplex_faces_map:
         for v in s:
@@ -286,14 +284,9 @@ def phase2(simplex_faces_map, G_frozen, N, logfile=None,
         nested[s] = set()
         s_pairs[s] = set()
 
-    # ── nested-set initialization, inverted (2026-07-18, exact) ──────────
-    # The previous loop scanned, for every simplex, every incident edge of
-    # every member node: sum_s sum_{v in s} deg_G(v), i.e. O(d^2) for a hub
-    # of degree d. Inverting the loop over EDGES and scanning only each
-    # edge's rarest node's simplex-index entry gives the identical nested
-    # sets at cost sum_e min-simplex-degree(e): any simplex s containing e
-    # contains every node of e, so it necessarily appears in
-    # simplex_index[v] for e's least-frequent node v.
+    # ── nested-set initialization ───────────────────────────────────────────
+    # For each edge, scan only the simplex list of its rarest node: any
+    # simplex containing the edge appears there.
     for e in G_frozen:
         v_star = min(e, key=lambda v: len(simplex_index.get(v, ())))
         for t in simplex_index.get(v_star, ()):
@@ -311,25 +304,11 @@ def phase2(simplex_faces_map, G_frozen, N, logfile=None,
         degsum[s] = sum(deg.get(v, 0) for v in s)
         sxc[s] = sum(nodeCrossN.get(v, 0.0) for v in s)
 
-    # ── phase-2 entry invariant (2026-07-28 bugfix) ──────────────────────
-    # The merge-delta bookkeeping below charges every nested face that is
-    # NOT owned by an operand at its isolated cost logC(N, n(e)). That is
-    # EXACT when the face's current owner is a singleton object (whose
-    # entire cost is that isolated cost) but WRONG when the owner is a
-    # real multi-face simplex nested inside a live object: the face is
-    # cheaply hosted there, so the "isolated" credit is spurious, and on
-    # states with real nested simplices phase 2 accepted merges whose true
-    # description-length change was strongly positive (observed: L=7
-    # reconstruction sweeps under the geometric size prior, where phase 1
-    # correctly declines marginal absorptions and thereby leaves real
-    # nested simplices alive -- the legacy prior left almost none, which
-    # is why this stayed latent). Restore the invariant the formulas
-    # assume: every real simplex nested inside another live object is
-    # absorbed into its SMALLEST enclosing live object up front,
-    # accepting the (typically marginal) cost; singletons stay put, since
-    # their accounting is exact. Ascending size order cascades chains.
-    # The post-merge nested-simplex cleanup maintains the invariant for
-    # the rest of the run.
+    # ── phase-2 entry invariant ─────────────────────────────────────────────
+    # The merge deltas below charge every nested face not owned by an
+    # operand at its isolated cost, which is exact only when the owner is
+    # a singleton. Absorb every real simplex nested inside another live
+    # object into its smallest enclosing object.
     _forced = 0
     for s in sorted(list(sfm), key=lambda t: (len(t), _enclosing_key(t))):
         if s not in sfm or len(sfm[s]) <= 1:
@@ -357,33 +336,18 @@ def phase2(simplex_faces_map, G_frozen, N, logfile=None,
         logfile.write(f"Phase2 entry: force-absorbed {_forced} real nested "
                       f"simplices (bookkeeping invariant)\n")
 
-    # ── collective absorption pass (2026-07-29 v15) ──────────────────────
-    # Under the geometric size prior a SINGLETON parent's first absorption
-    # pays the full +n(p) size cost, so phase 1's one-at-a-time deltas
-    # decline every child individually even when absorbing them
-    # collectively is strongly favorable (house-bills: a 400-cosponsor
-    # bill with hundreds of nested small bills -- each child saves a few
-    # bits, the size cost is paid ONCE). Exact phase 2 recovers this via
-    # (child, parent) merge pairs, but the LSH generator never proposes
-    # them (Jaccard(child, big parent) ~ 0), which produced eta = 0.9994
-    # on house-bills. Fix at the source: for each singleton parent p
-    # (ascending size, so children go to their smallest enclosing live
-    # parent, matching the assignment rule), every nested singleton child
-    # has individually negative absorption delta once the size cost is
-    # paid, so absorb ALL of them iff
-    #   n(p)*[size prior] + sum_c [logC(n(p),n(c)) - logC(N,n(c))] < 0.
-    # Exactly computable from the nested[] caches; a no-op under the
-    # legacy prior (phase 1 already absorbed every such child).
+    # ── collective absorption pass ──────────────────────────────────────────
+    # A singleton parent's first absorption pays its full size cost, so
+    # phase 1 declines children one at a time even when absorbing them
+    # jointly is favorable. For each inclusion-maximal singleton parent,
+    # absorb all nested singleton children iff the joint delta is negative.
     _coll = 0
     _sp_on = _size_prior_on()
     for p in sorted(list(sfm), key=lambda t: (len(t), _enclosing_key(t))):
         if p not in sfm or len(sfm[p]) != 1:
             continue
-        # only inclusion-MAXIMAL live parents: absorbing into a nested
-        # parent would recreate the real-nested configuration the
-        # invariant pass above just eliminated; a non-maximal parent's
-        # children (and the parent itself, as an edge) are collected by
-        # its enclosing parent later in this ascending sweep.
+        # inclusion-maximal live parents only: children of non-maximal
+        # parents are collected by their enclosing parent later in the sweep
         v_star = min(p, key=lambda v: len(simplex_index.get(v, ())))
         if any(t is not p and p < t for t in simplex_index.get(v_star, ())):
             continue
@@ -419,23 +383,11 @@ def phase2(simplex_faces_map, G_frozen, N, logfile=None,
             cands |= simplex_index.get(v, set())
         return cands
 
-    # Per-simplex overlap-neighbor sets, maintained incrementally: a merge's
-    # union overlaps exactly the (live) simplices that overlapped either
-    # operand, so nbrs[union] = nbrs[s1] | nbrs[s2] (steal the larger),
-    # filtered for liveness lazily at use. This replaces re-scanning the
-    # node -> simplices index over every node of the union after each merge,
-    # which is O(sum of the union's node degrees) and dominates once a
-    # growing simplex covers most of the graph.
-    # ── heavy/light neighbor split (2026-07-18) ──────────────────────────
-    # Storing every overlap-neighbor materializes the hub pair explosion
-    # (a node in d survivors contributes d(d-1) stored entries) before a
-    # single merge happens. Instead: nbrs[s] stores only neighbors
-    # reachable through LIGHT nodes (simplex-degree <= PHASE2_HUB_TAU at
-    # initialization); neighbors through the few HEAVY nodes are resolved
-    # on demand from simplex_index, which is now maintained incrementally
-    # through merges and therefore always current. Coverage is exact: any
-    # overlapping pair shares at least one node, found either in a stored
-    # light entry or in a heavy node's live index entry.
+    # Overlap-neighbor sets, maintained incrementally:
+    # nbrs[union] = nbrs[s1] | nbrs[s2], filtered for liveness at use.
+    # Only neighbors through LIGHT nodes (simplex-degree <= PHASE2_HUB_TAU)
+    # are stored; neighbors through heavy nodes are resolved on demand
+    # from simplex_index.
     heavy_nodes = {v for v, ts in simplex_index.items()
                    if len(ts) > PHASE2_HUB_TAU}
     hnodes = {s: frozenset(v for v in s if v in heavy_nodes) for s in sfm}
@@ -450,9 +402,7 @@ def phase2(simplex_faces_map, G_frozen, N, logfile=None,
                 if b is not a:
                     nb.add(b)
 
-    # Cached canonical sort key per simplex (the previous code recomputed
-    # tuple(sorted(s)) inside every sorted() call -- O(n log n) per
-    # comparison key, painful for giant simplices).
+    # canonical sort key per simplex, cached
     _key_cache = {}
     def _ckey(s):
         k = _key_cache.get(s)
@@ -471,7 +421,7 @@ def phase2(simplex_faces_map, G_frozen, N, logfile=None,
                   - (len(s2) if len(sfm[s2]) > 1 else 0))
 
     def _l1_seed_excluded(a, b):
-        """Single-overlap candidate restriction (SM Sec. I), applied
+        """Single-overlap candidate restriction, applied
         UNIFORMLY at seeding and at post-merge re-pairing: for |a & b| == 1
         the exactly computable part of the delta (everything except the
         cross-edge credit) decides candidacy; returns True when the pair
@@ -535,9 +485,8 @@ def phase2(simplex_faces_map, G_frozen, N, logfile=None,
             nsm, nbg = nbg, nsm
         own1, own2 = sfm[s1], sfm[s2]
         sharedU = sharedN = sharedA_N = 0.0
-        # |s1 & s2| <= 1: no hyperedge (>= 2 nodes) fits inside the
-        # intersection, so the shared-face terms vanish identically and the
-        # scan can be skipped (single-overlap exclusion lemma, SM Sec. I)
+        # |s1 & s2| <= 1: no hyperedge fits inside the intersection, so the
+        # shared-face terms vanish and the scan is skipped
         for e in (nsm if len(inter) > 1 else ()):
             if e in nbg:
                 j = len(e)
@@ -545,10 +494,8 @@ def phase2(simplex_faces_map, G_frozen, N, logfile=None,
                 sharedN += _logchoose(N, j)
                 if e in own1 and e in own2:
                     sharedA_N += _logchoose(N, j)
-        # delta without the cross edges; each cross edge only lowers it by
-        # at most logC(N, n(e)), so if delta_wo - allowance >= 0 the pair
-        # provably cannot merge and the (comparatively expensive) cross
-        # enumeration is skipped entirely (exact pruning).
+        # each cross edge lowers delta by at most logC(N, n(e)): if
+        # delta_wo - allowance >= 0 the pair provably cannot merge
         delta_wo = (C0 + U1 + U2 - sharedU
                     - ownSelf_c[s1] - ownSelf_c[s2]
                     - (nestN_c[s1] + nestN_c[s2] - sharedN
@@ -572,9 +519,8 @@ def phase2(simplex_faces_map, G_frozen, N, logfile=None,
         d = _delta(s1, s2)
         key = frozenset({s1, s2})
         if d is None:
-            # provably never merges in the current state; clear any earlier
-            # entry for this key so a matching stale heap tuple cannot pop
-            # as current later
+            # provably never merges in the current state; clear any stale
+            # entry for this key
             if valid.pop(key, None) is not None:
                 s_pairs.get(s1, set()).discard(key)
                 s_pairs.get(s2, set()).discard(key)
@@ -596,25 +542,16 @@ def phase2(simplex_faces_map, G_frozen, N, logfile=None,
         for dd in (sfm, nested, histN, nestN_c, ownN_c, ownSelf_c, degsum, sxc):
             dd.pop(s, None)
 
-    # ── initial heap: only pairs sharing >= 1 node (deterministic order) ─────
-    # Seeding is quadratic in the number of surviving simplices, and on
-    # dense corpora most overlapping pairs are provably never mergeable.
-    # For large survivor counts the SOUND lower bound of Eq. (delta-ss)
-    # (sharedU <= min(U1,U2); sharedN - sharedA_N >= 0 dropped;
-    # crossU - crossN >= -|cross|_cap * maxdec with |cross| bounded by the
-    # smaller difference side's incident-edge count) is evaluated for ALL
-    # pairs at once with blocked numpy matrix products; only pairs whose
-    # bound is negative get an exact delta and a heap entry, in the same
-    # deterministic (key-sorted) order as the direct loop. Pairs pruned
-    # here can never merge in the initial state and are re-considered
-    # automatically if a participant changes, so the merge sequence is
-    # unchanged (exact pruning).
+    # ── initial heap ────────────────────────────────────────────────────────
+    # A sound vectorized lower bound on the merge delta is evaluated for
+    # all overlapping pairs; only pairs whose bound is negative get an
+    # exact delta and a heap entry (exact pruning, deterministic order).
     surv = sorted(sfm, key=_ckey)
     S0 = len(surv)
 
     def _seed_pair_filtered(a, b):
         """Common candidate filter: skip non-overlapping pairs; apply the
-        single-overlap restriction (SM Sec. I) uniformly; otherwise push."""
+        single-overlap restriction uniformly; otherwise push."""
         small_op, big_op = (a, b) if len(a) <= len(b) else (b, a)
         ov = 0
         for v in small_op:
@@ -628,22 +565,16 @@ def phase2(simplex_faces_map, G_frozen, N, logfile=None,
             return
         _push(a, b)
 
-    # Budget clock starts BEFORE seeding (2026-07-22): on hub-heavy
-    # million-edge corpora the pre-loop work (candidate generation and
-    # exact-delta seeding) can dominate wall-clock, so it must count
-    # against budget_s. Seeding is truncatable: stopping early only
-    # removes candidates (restriction-only, output remains a valid
-    # decomposition).
+    # the optional wall-clock budget counts seeding as well; stopping
+    # early only removes candidates
     _t_start = time.time()
     _seed_deadline = (_t_start + budget_s) if budget_s is not None else None
 
     if approx:
-        # ── approximate seeding: MinHash-LSH + nestedness parents ─────────
-        # (proposal Sec. 7.3.1-7.3.2). Candidates come from LSH band
-        # collisions over node-set signatures plus each survivor's direct
-        # nested supersets; every candidate still goes through the exact
-        # delta, so approximation = missed candidates only. Hub buckets
-        # are capped at hub_cap lowest-key members.
+        # ── approximate seeding: MinHash-LSH + nestedness parents ───────────────
+        # Candidates come from LSH band collisions over node-set signatures
+        # plus each survivor's direct nested supersets; every candidate is
+        # still scored with the exact delta. Hub buckets capped at hub_cap.
         rng_lsh = np.random.RandomState(0)
         node_ids = {v: i for i, v in enumerate(edge_index.keys())}
         P_MOD = (1 << 61) - 1
@@ -685,11 +616,8 @@ def phase2(simplex_faces_map, G_frozen, N, logfile=None,
                         if kpr not in seen_pairs:
                             seen_pairs.add(kpr)
                             cand_list.append(kpr)
-        # nestedness parents among survivors (rarest-node containment scan).
-        # Hub guard (2026-07-22): if even the RAREST node of a survivor
-        # sits in more than 64*hub_cap survivors, scanning its list is
-        # quadratic poison on heavy-tailed corpora -- skip it (candidates
-        # lost only; LSH collisions can still propose such pairs).
+        # nestedness parents among survivors (rarest-node containment scan);
+        # skip nodes whose survivor list is very large (candidates lost only)
         _nested_scan_cap = 64 * hub_cap
         surv_pos_l = {sv: i for i, sv in enumerate(surv)}
         for i, sv in enumerate(surv):
@@ -728,19 +656,10 @@ def phase2(simplex_faces_map, G_frozen, N, logfile=None,
                     continue
                 _push(s, other)
     else:
-        # ── nnz-proportional pair accumulation (2026-07-18, exact) ───────
-        # The previous implementation built a DENSE S0 x Nn incidence
-        # matrix and blocked S0 x S0 matmuls: O(S0 * Nn) memory and
-        # O(S0^2 * Nn) flops regardless of sparsity, which is exactly
-        # backwards on large corpora (S0 ~ E right after phase 1). Here
-        # the same intersection counts and degree-weighted intersections
-        # are accumulated only over pairs that actually share a node:
-        # for each node, the C(d, 2) survivor pairs through it are
-        # generated as index arrays and grouped with np.unique, so cost
-        # and memory are proportional to the number of overlapping pair
-        # incidences sum_v C(d_v, 2) -- the true output size -- with no
-        # dense N dimension anywhere. Bound expressions, pruning, and the
-        # deterministic evaluation order are unchanged.
+        # ── pair accumulation over overlapping pairs only ───────────────────────
+        # For each node, the survivor pairs through it are generated as index
+        # arrays and grouped with np.unique, so cost is proportional to
+        # sum_v C(d_v, 2).
         n_arr = np.array([len(sv) for sv in surv], dtype=np.int64)
         oS = np.array([ownSelf_c[sv] for sv in surv])
         oN = np.array([ownN_c[sv] for sv in surv])
@@ -778,22 +697,11 @@ def phase2(simplex_faces_map, G_frozen, N, logfile=None,
                                     dtype=np.int64, count=d))
             npairs_v = d * (d - 1) // 2
             if node_pair_cap is not None and npairs_v > node_pair_cap:
-                # ── per-STRUCTURE stochastic shortcut (2026-07-28) ────────
-                # A single hub node of survivor-degree d contributes
-                # C(d,2) candidate pairs, so one heavy structure -- not
-                # system size -- is what makes exact seeding quadratic.
-                # For such nodes only, draw a seeded uniform subsample of
-                # ~node_pair_cap of their pairs (deduplicated within the
-                # node); all other nodes are enumerated exhaustively, so
-                # cost is sum_v min(C(d_v,2), node_pair_cap). SOUND:
-                # every surviving pair still passes through the exact
-                # delta, so subsampling can only MISS candidate merges.
-                # Pairs overlapping in >=2 nodes are regenerated at each
-                # shared node and recoverable via post-merge re-pairing;
-                # what is thinned is dominated by single-overlap hub
-                # pairs, which the l1 seeding restriction screens hardest
-                # anyway. Seeded per node (crc32 of the node label), so
-                # runs are reproducible independent of hash randomization.
+                # ── per-node candidate-pair budget ──────────────────────────────────────
+                # A hub node of survivor-degree d contributes C(d,2) pairs;
+                # nodes over node_pair_cap contribute a seeded uniform
+                # subsample instead. Subsampling can only miss candidate
+                # merges, never execute unsound ones.
                 rng = np.random.default_rng(
                     zlib.crc32(repr(v).encode('utf8', 'replace')))
                 a = rng.integers(0, d, size=2 * node_pair_cap)
@@ -827,40 +735,26 @@ def phase2(simplex_faces_map, G_frozen, N, logfile=None,
             if _sp:
                 # exact size-prior contribution (same for bound and delta)
                 base = base + u - spn[ii] - spn[jj]
-            # generic bound: sharedU <= min(U1,U2); cross charge bounded by
-            # either the count*maxdec allowance or the per-node exact-size
-            # allowance min(sxc1, sxc2) -- both sound, take the tighter
+            # sound generic bound: sharedU <= min(U1, U2); cross charge bounded
+            # by the allowance terms
             sxa = np.minimum(sx[ii], sx[jj])
             allow = np.minimum(np.maximum(cc, 0) * maxdec[u], sxa)
             bound = C0 + np.maximum(U1, U2) + base - allow
-            # ── single-overlap seeding restriction (SM Sec. I) ────────────
-            # When |s1 & s2| == 1 no hyperedge fits inside the intersection,
-            # so the shared-face terms vanish IDENTICALLY and the delta
-            # decomposes into exactly computable per-simplex terms plus the
-            # cross-edge credit. A pair sharing a single node is seeded only
-            # if the exactly computable part alone is negative (the cross
-            # credit is forfeited at seeding; it remains available to every
-            # pair re-evaluated after either participant changes). Removes
-            # the hub-node pair explosion on heavy-tailed corpora.
+            # ── single-overlap seeding restriction ──────────────────────────────────
+            # For |s1 & s2| == 1 the delta decomposes into exactly computable
+            # per-simplex terms plus the cross-edge credit; seed only if the
+            # exact part alone is negative (the credit remains available at
+            # every re-evaluation).
             l1 = it == 1
             if l1.any():
                 excl_l1 = C0 + U1 + U2 + base
                 bound = np.where(l1, excl_l1, bound)
             keep = bound < 0
             ki, kj, kb = ii[keep], jj[keep], bound[keep]
-            # ── per-OBJECT seeding candidate budget (2026-07-29) ──────────
-            # The bound-survivor list itself was unbounded: on hub-heavy
-            # corpora (amplified by the geometric prior's -ell size bonus,
-            # which makes overlap bounds more negative) it reached
-            # millions of entries -- gigabytes of candidate storage plus
-            # millions of exact delta evaluations, the OOM-killed-worker
-            # slowdown of the 2026-07-29 corpus runs. Apply the SAME
-            # per-object budget used at re-pairing: each object enters
-            # the heap with at most its hub_cap best candidates by the
-            # sound lower bound. Deterministic (ties broken by pair
-            # index); restriction-only -- a pruned pair re-enters via
-            # post-merge re-pairing as soon as either participant
-            # changes. Exact-delta work is now <= hub_cap * S0.
+            # ── per-object candidate budget ─────────────────────────────────────────
+            # Each object enters the heap with at most hub_cap candidates,
+            # ranked by the sound lower bound; a pruned pair re-enters via
+            # post-merge re-pairing as soon as either participant changes.
             if len(ki) > 0:
                 def _group_ranks(g, b):
                     o = np.lexsort((np.arange(len(g)), b, g))
@@ -879,8 +773,7 @@ def phase2(simplex_faces_map, G_frozen, N, logfile=None,
                 keep2 = (r_i < hub_cap) | (r_j < hub_cap)
                 ki, kj = ki[keep2], kj[keep2]
             # exact evaluation in the deterministic order of the direct
-            # double loop (ascending first index, then second); arrays,
-            # not python tuples, so survivor storage stays compact
+            # double loop
             o = np.lexsort((kj, ki))
             ki, kj = ki[o], kj[o]
             for _ci in range(len(ki)):
@@ -900,12 +793,9 @@ def phase2(simplex_faces_map, G_frozen, N, logfile=None,
     while heap:
         d, s1, s2 = heapq.heappop(heap)
         n_pops += 1
-        # ── optional two-stage wall-clock budget (proposal Sec. 7.4):
-        # stage 1 (at budget_s): tighten the candidate knobs -- tightening
-        # only ever RESTRICTS which candidates get pushed, so state stays
-        # consistent; stage 2 (at 2*budget_s): stop merging outright and
-        # finalize -- every intermediate greedy state is a valid
-        # decomposition, so the result is simply the best found in budget.
+        # ── optional two-stage wall-clock budget ────────────────────────────────
+        # stage 1: tighten the candidate knobs (restriction-only);
+        # stage 2: stop merging and finalize the best decomposition found.
         if budget_s is not None and n_pops % 1000 == 0 \
                 and time.time() - _t_start > budget_s:
             if _budget_stage == 0:
@@ -929,9 +819,8 @@ def phase2(simplex_faces_map, G_frozen, N, logfile=None,
             continue
         if d >= 0:
             break                                  # no beneficial merge left
-        # minimum-improvement threshold (approx mode; SWeG-style decay).
-        # theta_t shrinks as merges accumulate, so early merges must clear
-        # a higher bar; rejected entries are dropped (restriction only).
+        # minimum-improvement threshold (approx mode, decaying); rejected
+        # entries are dropped (restriction only)
         if theta > 0.0 and d >= -(theta / (1.0 + itr)):
             valid.pop(key, None)
             s_pairs.get(s1, set()).discard(key)
@@ -943,8 +832,8 @@ def phase2(simplex_faces_map, G_frozen, N, logfile=None,
         union = s1 | s2
         u = len(union)
         if size_cap is not None and u > size_cap:
-            # giant-simplex guard (approx mode): skip merges whose union
-            # would exceed size_cap; drop the entry so it cannot re-pop
+            # giant-simplex guard (approx mode): skip merges whose union would
+            # exceed size_cap
             valid.pop(key, None)
             s_pairs.get(s1, set()).discard(key)
             s_pairs.get(s2, set()).discard(key)
@@ -977,10 +866,7 @@ def phase2(simplex_faces_map, G_frozen, N, logfile=None,
         degsum_u = degsum[s1] + degsum[s2] - sum(deg.get(v, 0) for v in inter_nodes)
         sxc_u = sxc[s1] + sxc[s2] - sum(nodeCrossN.get(v, 0.0) for v in inter_nodes)
 
-        # Remove merged simplices from all data structures. Light-node
-        # neighbors are carried in nbrs (steal the larger, drop dead
-        # entries); heavy-node neighbors are resolved on demand from the
-        # incrementally maintained simplex_index below.
+        # remove merged simplices from all data structures
         _invalidate(s1); _invalidate(s2)
         light_u = nbrs.pop(s1, set()) if s1 != union else set(nbrs.get(s1, ()))
         light_2 = nbrs.pop(s2, set()) if s2 != union else set(nbrs.get(s2, ()))
@@ -1004,8 +890,7 @@ def phase2(simplex_faces_map, G_frozen, N, logfile=None,
                 for v in op:
                     simplex_index[v].discard(op)
 
-        # Register the union (owned == nested for merge-born simplices,
-        # matching the previous sfm[union] = all-nested behavior)
+        # register the union (owned == nested for merge-born simplices)
         sfm[union] = nested_u
         nested[union] = nested_u
         histN[union] = hist_u
@@ -1021,8 +906,7 @@ def phase2(simplex_faces_map, G_frozen, N, logfile=None,
         for v in union:
             simplex_index[v].add(union)
 
-        # heavy-node neighbors, on demand from the live index (few heavy
-        # nodes; entries are current thanks to the incremental maintenance)
+        # heavy-node neighbors resolved on demand from the live index
         heavy_live = set()
         for v in hn_u:
             heavy_live |= simplex_index.get(v, set())
@@ -1030,9 +914,7 @@ def phase2(simplex_faces_map, G_frozen, N, logfile=None,
 
         cand_all = light_u | heavy_live
 
-        # Remove simplices now strictly nested inside the union (any such k
-        # shares every node with the union, hence appears among the light
-        # neighbors or a heavy node's index entry)
+        # remove simplices now strictly nested inside the union
         nested_simps = [k for k in cand_all if k in sfm and k < union]
         for k in nested_simps:
             _invalidate(k)
@@ -1049,34 +931,19 @@ def phase2(simplex_faces_map, G_frozen, N, logfile=None,
         if logfile:
             logfile.write(f"Phase2 iter {itr}: |{len(s1)}|+|{len(s2)}|->|{u}|  delta={d:.3f}\n")
 
-        # Register the union's light neighbors (compacted to live entries)
-        # and mirror the union into the light neighbors' own sets; heavy
-        # neighbors intentionally NOT stored -- future lookups will find
-        # the union through the heavy nodes' index entries.
+        # register the union's light neighbors and mirror it into theirs
         light_live = [x for x in light_u if x in sfm]
         nbrs[union] = set(light_live)
         for x in light_live:
             nbrs.setdefault(x, set()).add(union)
 
-        # Post-merge re-pairing, with the SAME single-overlap restriction
-        # as seeding (SM Sec. I, applied uniformly): a hub-touching union
-        # would otherwise re-pair with every simplex at the hub each time
-        # it grows. Overlap size is computed over the smaller operand.
+        # post-merge re-pairing, with the same single-overlap restriction
+        # as seeding
         live = [x for x in cand_all if x in sfm]
         live_sorted = sorted(live, key=_ckey)
-        # per-union re-pairing budget (2026-07-29 v13): BOTH candidate
-        # classes are budgeted at hub_cap. The previous version kept all
-        # overlap->=2 neighbors on the assumption they are few -- false
-        # on hub-dense networks (ingredients, cast members, tags), where
-        # a growing union overlaps hundreds of objects in >=2 nodes
-        # after EVERY merge; profiling showed 2e5 exact deltas (~90% of
-        # runtime, unbounded heap/pair bookkeeping = the memory crashes)
-        # on a 1,200-edge cooking network. Each class independently
-        # keeps a seeded random sample of hub_cap when larger --
-        # restriction-only, and re-pairing recurs at every subsequent
-        # merge, so coverage accumulates across the run. (stochastic_eps
-        # is retained in the signature for backward compatibility but is
-        # no longer used.)
+        # per-union re-pairing budget: both candidate classes (overlap >= 2
+        # and single-overlap) are subsampled to hub_cap when larger;
+        # re-pairing recurs at every merge
         _l1_c, _ge2_c = [], []
         for s_other in live_sorted:
             small_op = s_other if len(s_other) <= u else union
@@ -1100,8 +967,7 @@ def phase2(simplex_faces_map, G_frozen, N, logfile=None,
             _push(union, s_other)
         for s_other in _l1_c:
             if _l1_seed_excluded(union, s_other):
-                # clear any stale entry for this key (same reasoning as in
-                # _push's pruning branch)
+                # clear any stale entry for this key
                 key = frozenset({union, s_other})
                 if valid.pop(key, None) is not None:
                     s_pairs.get(union, set()).discard(key)
@@ -1115,9 +981,7 @@ def phase2(simplex_faces_map, G_frozen, N, logfile=None,
                     for k1, k2 in [tuple(sorted(k, key=_ckey))]]
             heapq.heapify(heap)
 
-    # record budget outcome for callers (last_run_info is (re)initialized by
-    # greedy_optimizer before phase2 runs; harmless if phase2 is called
-    # directly in tests)
+    # record budget outcome for callers
     last_run_info['budget_stage'] = _budget_stage
     last_run_info['n_pops'] = n_pops
     last_run_info['n_merges'] = itr
@@ -1132,63 +996,14 @@ def greedy_optimizer(G_list, logpath='/dev/null', N=None, mode='auto',
                      node_pair_cap='auto', seed_mem_cap=None):
     """Two-phase greedy MDL optimizer. Returns (S, H, DL, eta).
 
-    By default N is inferred as the number of distinct nodes participating
-    in at least one hyperedge of G_list. Pass an explicit N to override
-    this -- e.g. when G_list is a small hyperedge set embedded in a much
-    larger ambient network (only the node-set prior costs log C(N, n(s))
-    depend on N; neither phase enumerates nodes, so this is a pure
-    parameter override with no change to existing call sites, all of
-    which omit N and get the original inferred behavior).
-
-    mode:
-      'exact'  -- exhaustive candidate enumeration (previous behavior).
-      'approx' -- MinHash-LSH candidate seeding with per-hub caps and
-                  optional merge thresholds (see phase2); every proposed
-                  merge is still evaluated with the exact delta, so the
-                  approximation can only MISS merges, never execute an
-                  unsound one.
-      'auto'   -- measure complexity after phase 1 and switch to 'approx'
-                  when the overlapping-pair upper bound sum_v C(d_v, 2)
-                  exceeds pair_cap, E exceeds edge_cap, or the maximum
-                  node simplex-degree exceeds 10*hub_cap.
-
-    node_pair_cap (2026-07-28, per-structure stochastic shortcut): in
-    exact seeding, any single node whose survivor-degree d gives
-    C(d,2) > node_pair_cap contributes only a seeded uniform subsample of
-    ~node_pair_cap of its candidate pairs; all other nodes are enumerated
-    exhaustively. The shortcut therefore engages per heavy STRUCTURE, not
-    per system: small systems (max d ~ sqrt(2*cap), ~45 at the default)
-    are bit-identical to exhaustive enumeration, and seeding cost is
-    bounded by sum_v min(C(d_v,2), cap) -- smooth in system size, with no
-    global mode switch. Since every surviving candidate is still scored
-    with the exact merge delta, subsampling can only miss merges, never
-    execute an unsound one. With the cap active, 'auto' escalates to the
-    LSH 'approx' path on a single MEMORY criterion: the exact seeding
-    tables' estimated footprint (pair arrays + dense Hm/Utab, computed
-    from the post-phase-1 degree histogram) exceeding seed_mem_cap
-    bytes. No wall-clock is involved, and escalated instances run the
-    default LSH settings (no per-tier presets). Those defaults follow
-    two stated rules rather than tuning: collision threshold 1/2 (the
-    parameter-free majority-similarity rule -- propose a pair iff its
-    node sets are more similar than dissimilar) and signature length
-    k = 25 = 1/(4*delta^2), fixing the MinHash similarity estimator's
-    standard error at the threshold to delta = 0.1. Lean by design: the
-    escalation path exists FOR memory (128-perm signatures cost 5x more;
-    2026-07-29 crash postmortem). The method thus carries
-    exactly three resource constants: node_pair_cap (per-node seeding
-    pair budget), hub_cap (per-union re-pairing budget, also the LSH
-    bucket cap), and seed_mem_cap (bytes). The legacy pair_est/dmax/
-    edge_cap triggers apply only when node_pair_cap=None, which also
-    restores the previous behavior exactly.
-
-    The mode actually used and its triggering metrics are recorded in the
-    module-level dict `last_run_info`.
-
-    Arguments left at their sentinels resolve to the module-level
-    resource constants (env-overridable; see the block at the top of
-    this file): hub_cap/lsh_num_perm/lsh_threshold/seed_mem_cap = None,
-    node_pair_cap = 'auto' ('auto' -> NODE_PAIR_CAP; an explicit None
-    still selects the legacy pre-cap behavior).
+    N defaults to the number of distinct nodes in G_list; pass an
+    explicit N to embed G_list in a larger ambient system.
+    mode: 'exact' (exhaustive candidate seeding), 'approx' (MinHash-LSH
+    seeding with per-hub caps), or 'auto' (use 'approx' only when the
+    estimated memory footprint of exact seeding exceeds seed_mem_cap).
+    Resource arguments left at None resolve to the module-level
+    constants; budget_s optionally imposes a two-stage wall-clock
+    budget.
     """
     if hub_cap is None:
         hub_cap = HUB_CAP
@@ -1208,23 +1023,14 @@ def greedy_optimizer(G_list, logpath='/dev/null', N=None, mode='auto',
         lf.write(f"N={N}  E={len(G_frozen)}  L0={baseline_DL(G_frozen, N):.3f}\n\n")
         lf.write("=== Phase 1 ===\n")
         sfm = phase1(G_frozen, N, logfile=lf if verbose_log else None)
-        # ── complexity measure and auto switch (proposal Sec. 7.2) ───────
+        # ── complexity estimate and auto mode switch ────────────────────────────
         deg_S = Counter(v for s_ in sfm for v in s_)
         pair_est = sum(dd * (dd - 1) // 2 for dd in deg_S.values())
         E_ = len(G_frozen)
         dmax = max(deg_S.values(), default=0)
         if node_pair_cap is not None:
-            # per-node subsampling bounds seeding COST structurally, but
-            # the exact vectorized seeding still materializes its tables:
-            # the pair arrays (~24 B per generated pair entry) and the
-            # dense per-simplex tables Hm (S0 x (kmax+1)) and Utab
-            # (S0 x (2*n_max+1)), 8 B each. 2026-07-29: estimate those
-            # bytes up front and escalate to the LSH generator on MEMORY
-            # grounds when they would exceed seed_mem_cap -- the same
-            # justification as the E > edge_cap trigger, per instance
-            # rather than at an arbitrary size threshold. (Concurrent
-            # multi-GB seeding workers crashed the 2026-07-28 overnight
-            # corpus run.) No wall-clock enters anywhere.
+            # exact seeding materializes its pair arrays; estimate their memory
+            # footprint from the survivor degree histogram
             S0_ = len(sfm)
             nmax_ = max((len(s_) for s_ in sfm), default=0)
             kmax_ = max((len(e) for e in G_frozen), default=0)
@@ -1233,10 +1039,7 @@ def greedy_optimizer(G_list, logpath='/dev/null', N=None, mode='auto',
             seed_mem_est = (24 * pairs_capped
                             + 8 * S0_ * (kmax_ + 1)
                             + 8 * S0_ * (2 * nmax_ + 1)) if S0_ >= 300 else 0
-            # single escalation criterion (2026-07-29 consolidation):
-            # the estimated memory footprint alone decides -- any
-            # million-edge instance blows the estimate anyway, so the
-            # old E > edge_cap trigger was redundant with it
+            # escalation criterion: the estimated memory footprint alone decides
             approx = (mode == 'approx') or (mode == 'auto' and
                       seed_mem_est > seed_mem_cap)
             trigger = ('forced' if mode == 'approx' else
@@ -1261,13 +1064,7 @@ def greedy_optimizer(G_list, logpath='/dev/null', N=None, mode='auto',
                              lsh_threshold=lsh_threshold, theta=theta)
         lf.write(f"mode={last_run_info['mode']} (requested {mode}; "
                  f"pair_est={pair_est} E={E_} dmax={dmax} trigger={trigger})\n")
-        # description_length(..., list(sfm), N) here is diagnostic only (it
-        # isn't used for anything but this log line) and costs O(E * |S|)
-        # even with the indexed _assign_faces helper once |S| is large --
-        # right after phase 1 is exactly when |S| is largest, before phase 2
-        # has had a chance to shrink it. Skip it unless a real log file was
-        # requested (logpath defaults to /dev/null on every empirical-corpus
-        # call, so this was previously paid on every single network).
+        # diagnostic log only; skipped unless a real log file was requested
         if verbose_log:
             lf.write(f"After Phase 1: |S|={len(sfm)}  DL={description_length(G_frozen, list(sfm), N):.3f}\n\n")
         else:
