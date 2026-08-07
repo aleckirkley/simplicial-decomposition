@@ -54,6 +54,3 @@ candidate-pair budget, a per-object candidate budget, and a memory
 bound under which candidate seeding switches to a MinHash-LSH
 generator, implemented in numpy), allowing for easy scalability to very large systems 
 
-## Citing
-
-If you use this code, please cite the paper above.
