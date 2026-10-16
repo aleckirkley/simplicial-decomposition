@@ -7,11 +7,6 @@ and a **residual** of independent hyperedges. The method minimizes a
 description length derived from a Bayesian generative model (equivalently,
 performs maximum-a-posteriori inference) and has no tunable parameters.
 
-Companion code for:
-
-> A. Kirkley and F. Battiston, *When are hypergraphs simplicial?*
-> (2026). [journal / arXiv link]
-
 ## Contents
 
 - `simplicial_decomposition.py` — the complete algorithm in one file,
