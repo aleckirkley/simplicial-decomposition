@@ -1,32 +1,27 @@
 """
-Reproduce the Fig.-1 example of the paper: decompose a small deterministic
-hypergraph (two noisy simplices, one complete simplex, and seven sparse
-hyperedges) and print the observed hypergraph and its inferred simplicial
-decomposition.
+Example from Fig. 1 of the paper: two noisy simplices, one complete
+triangle, and seven sparse hyperedges.
 
-Usage:  python reproduce_fig1.py
-Dependencies: Python standard library only.
+Run with: python reproduce_fig1.py
 """
 from simplicial_decomposition import decompose
 
-# ── the deterministic Fig.-1 hypergraph ──────────────────────────────────────
-# A 5-node and a 4-node simplex with roughly half of their proper faces
-# removed, a complete 3-node simplex, and seven sparse hyperedges (two
-# connectors, five danglers) tying everything into one component.
+# a 5-node and a 4-node simplex with about half of their faces missing,
+# a complete triangle, and seven extra hyperedges connecting things
 G = [
-    # S1 = {0..4}: top face + 2 quadruples + 3 triples + 5 pairs
+    # simplex on 0-4
     {0, 1, 2, 3, 4},
     {0, 1, 2, 3}, {1, 2, 3, 4},
     {0, 1, 2}, {2, 3, 4}, {0, 3, 4},
     {0, 1}, {1, 2}, {2, 3}, {3, 4}, {0, 4},
-    # S2 = {5..8}: top face + 2 triples + 3 pairs
+    # simplex on 5-8
     {5, 6, 7, 8},
     {5, 6, 7}, {6, 7, 8},
     {5, 6}, {7, 8}, {5, 8},
-    # S3 = {9,10,11}: complete triangle
+    # triangle on 9-11
     {9, 10, 11},
     {9, 10}, {9, 11}, {10, 11},
-    # sparse connectors / danglers (pairwise node-disjoint)
+    # other hyperedges
     {3, 8}, {7, 9, 12}, {0, 13}, {2, 14, 15}, {6, 16}, {10, 17, 18}, {11, 19},
 ]
 
@@ -36,7 +31,7 @@ def fmt(e):
 
 
 def fmt_row(edges, indent='  ', width=76):
-    """Wrap a list of hyperedges into tidy indented lines."""
+    """Print hyperedges over several lines."""
     lines, line = [], indent
     for e in edges:
         tok = fmt(e) + ' '
@@ -48,13 +43,11 @@ def fmt_row(edges, indent='  ', width=76):
     return '\n'.join(lines)
 
 
-# ── observed hypergraph ──────────────────────────────────────────────────────
 nodes = sorted(set(v for e in G for v in e))
 print(f'observed hypergraph G: {len(G)} hyperedges on {len(nodes)} nodes')
 print(fmt_row(sorted((frozenset(e) for e in G),
                      key=lambda e: (-len(e), tuple(sorted(e))))))
 
-# ── decomposition ────────────────────────────────────────────────────────────
 result = decompose(G)
 
 print('\ninferred decomposition:')

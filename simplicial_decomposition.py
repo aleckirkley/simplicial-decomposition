@@ -1,38 +1,33 @@
 """
-simplicial_decomposition.py -- MDL simplicial decomposition of hypergraphs.
+MDL simplicial decomposition of hypergraphs.
 
-Decomposes an observed hypergraph G into a set S of latent simplices and
-a residual set H of independent hyperedges by minimizing the description
-length (equivalently, maximizing the Bayesian posterior of the paper's
-generative model). Every collection is encoded as a SET, size class by
-size class:
+Splits an observed hypergraph G into a set S of latent simplices and a set H
+of residual hyperedges by minimizing the description length (in bits)
 
-    L(S,H) = sum_j log2 C(C(N,j), |H_j|)                      (residual hyperedges)
-           + sum_j log2 C(C(N,j), |S_j|)                      (simplex node sets)
-           + sum_s [ n(s) + sum_j log2 C(C(n(s),j), |F_j(s)|) ]   (hosted faces)
+    L(S, H) = sum_j log2 C(C(N,j), |H_j|)
+            + sum_j log2 C(C(N,j), |S_j|)
+            + sum_s [ n(s) + sum_j log2 C(C(n(s),j), |F_j(s)|) ]
 
-    L0     = sum_j log2 C(C(N,j), |G_j|)                      (null: uniform random hypergraph)
+against the null
 
-Here X_j counts objects of size j, n(.) counts nodes, N is the number of nodes,
-and F(s) is the set of observed hyperedges hosted by simplex s. Because the
-null is a uniform random hypergraph with G's size sequence, random
-hypergraphs give eta = L/L0 = 1.
+    L0 = sum_j log2 C(C(N,j), |G_j|),
 
-The optimizer is an exact two-phase greedy: collective absorption into
-enclosing hyperedges, then best-first merging of overlapping objects, each
-followed by a nucleation pass. Every move is scored exactly. Two resource
-budgets bound the work: a per-node candidate-pair budget and a per-object
-re-pairing budget.
+where X_j is the number of elements of X with j nodes, N is the number of
+nodes and F(s) are the observed hyperedges hosted by simplex s. The null is a
+uniform random hypergraph with the same size sequence as G, so random
+hypergraphs give eta = L / L0 = 1.
 
-Quick start:
+Optimization is greedy in two phases (absorption of nested hyperedges, then
+best-first merging of overlapping objects), each followed by a joint pass
+over near-miss moves. All moves are scored by their exact change in L.
+
+Usage:
 
     from simplicial_decomposition import decompose
-    result = decompose(hyperedges)          # iterable of node collections
-    result['S']      # inferred simplices (list of frozensets)
-    result['H']      # residual hyperedges (list of frozensets)
-    result['eta']    # compression ratio L / L0 (1.0 = no simplicial structure)
+    result = decompose(hyperedges)
+    result['S'], result['H'], result['eta']
 
-Dependencies: Python >= 3.9 standard library only.
+Requires Python >= 3.9, standard library only.
 """
 
 import functools
@@ -44,25 +39,21 @@ import time
 import zlib
 from collections import Counter, defaultdict
 
+# max candidate pairs seeded per node (a fixed random subsample above this)
 NODE_PAIR_CAP = int(float(os.environ.get('SD_NODE_PAIR_CAP', 1_000)))
-#   per-node seeding pair budget (seeded uniform subsample above it)
+# max new partners re-paired with each merged object
 HUB_CAP = int(float(os.environ.get('SD_HUB_CAP', 100)))
-#   per-object re-pairing budget after each merge
 
 last_run_info = {}
 
 
 def _enclosing_key(s):
-    """Canonical tie-break key for selecting the smallest enclosing simplex:
-    size first, then lexicographic on the sorted node tuple. Guarantees a
-    deterministic choice whenever multiple candidates in S have equal size."""
+    """Sort key for picking the smallest enclosing simplex (size, then nodes)."""
     return (len(s), tuple(sorted(s)))
 
 
 def _assign_faces(G_frozen, S):
-    """Assign each edge in G_frozen to its smallest enclosing simplex in S
-    (ties broken via _enclosing_key)
-    """
+    """Assign each hyperedge to its smallest enclosing simplex in S."""
     faces_assigned = {s: [] for s in S}
     covered = set()
     if not S:
@@ -90,8 +81,7 @@ def _assign_faces(G_frozen, S):
 
 
 def _finalise(G_frozen, S, DL, L0):
-    """Drop neutral singletons (A(s) = {s}), then return
-    (S, H, DL, eta)."""
+    """Drop simplices that only host themselves; return (S, H, DL, eta)."""
     faces_assigned, _ = _assign_faces(G_frozen, S)
     S = [s for s in S if set(faces_assigned[s]) != {s}]
     _, covered = _assign_faces(G_frozen, S)
@@ -104,7 +94,7 @@ _LN2 = math.log(2)
 
 @functools.lru_cache(maxsize=1 << 20)
 def _lc(n, k):
-    """log2 C(n, k) (float n allowed only via _lcc)."""
+    """log2 C(n, k)."""
     if k < 0 or k > n:
         return float('inf')
     return (math.lgamma(n + 1) - math.lgamma(k + 1) - math.lgamma(n - k + 1)) / _LN2
@@ -116,11 +106,11 @@ def _lfact2(k):
 
 @functools.lru_cache(maxsize=1 << 20)
 def _lcc(n, j, k):
-    """log2 C(C(n, j), k): bits to name a k-subset of the j-subsets of n nodes."""
+    """log2 C(C(n, j), k), i.e. bits to pick k of the j-subsets of n nodes."""
     if k == 0:
         return 0.0
     lx = _lc(n, j)
-    if lx < 40:                                   # X = C(n,j) < ~1e12: exact
+    if lx < 40:  # X small enough to compute exactly
         X = math.comb(n, j)
         if k > X:
             return float('inf')
@@ -129,8 +119,8 @@ def _lcc(n, j, k):
                     - math.lgamma(k + 1)) / _LN2
         return (math.lgamma(X + 1) - math.lgamma(k + 1)
                 - math.lgamma(X - k + 1)) / _LN2
-    # X >= 1e12: log (X)_k = k log X + sum_i log(1 - i/X), two-term expansion
-    if lx > 900:                                  # corrections < 1e-200 bits
+    # large X: expand log(X choose k) in 1/X to second order
+    if lx > 900:  # corrections are negligible
         return k * lx - _lfact2(k)
     X = 2.0 ** lx
     s1 = k * (k - 1) / 2.0
@@ -139,14 +129,13 @@ def _lcc(n, j, k):
 
 
 def set_local_cost(n, hist, nest=None):
-    """Per-simplex cost: n bits + set code of its faces, size class by size class.
+    """Cost of one simplex with n nodes.
 
-    hist: sizes of the faces this simplex hosts (smallest-enclosing rule).
-    nest: sizes of ALL observed hyperedges nested in the simplex. Faces in an
-    overlap with a smaller simplex are hosted there, but G is the union of
-    what the simplices emit, so this simplex may also emit them. Since
-    log C(X, k) is concave in k, emitting all of them or none is optimal in
-    each size class, so the class costs min(code(k_own), code(k_nested))."""
+    hist counts the faces it hosts by size. nest (optional) counts all observed
+    hyperedges inside it, including ones hosted by a smaller overlapping
+    simplex. The simplex may also emit those, and since log C(X, k) is concave
+    in k it is best to emit all or none of them, so each size class costs the
+    smaller of the two codes."""
     if nest is None:
         return n + sum(_lcc(n, j, c) for j, c in hist.items() if c)
     L = n
@@ -173,10 +162,9 @@ def set_baseline_DL(G_frozen, N):
 
 
 def set_description_length(G_frozen, S, N):
-    """L(S, H) under the set code, with the manuscript's assignment rule
-    (each edge is hosted by its smallest enclosing simplex; ties are broken
-    by _enclosing_key; a simplex whose only face is itself is an isolated
-    edge). Enclosing simplices may also emit overlap faces (set_local_cost)."""
+    """Description length L(S, H). Each hyperedge is hosted by its smallest
+    enclosing simplex, and a simplex hosting only itself counts as a residual
+    hyperedge."""
     S = list(S)
     faces_assigned, covered = _assign_faces(G_frozen, S)
     Hc = Counter(len(e) for e in G_frozen if e not in covered)
@@ -185,9 +173,9 @@ def set_description_length(G_frozen, S, N):
     for s in S:
         fa = faces_assigned.get(s, [])
         if not fa:
-            continue                      # a simplex with no faces is not part of the model
+            continue  # empty simplex, ignore
         if len(fa) == 1 and fa[0] == s:
-            Hc[len(s)] += 1               # singleton = isolated edge
+            Hc[len(s)] += 1  # counts as a residual hyperedge
             continue
         real.append(s)
     nest = {s: Counter() for s in real}
@@ -211,41 +199,41 @@ def set_description_length(G_frozen, S, N):
 
 
 class _SetState:
-    """Exact face-map state for the set-code objective."""
+    """Bookkeeping for the greedy: which observed hyperedges each object
+    (simplex or residual hyperedge) owns, plus the size counts needed to
+    score merges incrementally."""
 
     def __init__(self, G_frozen, N):
         self.N = N
         self.G = G_frozen
-        self.faces = {e: {e} for e in G_frozen}          # object -> owned edges
+        self.faces = {e: {e} for e in G_frozen}  # object -> owned hyperedges
         self.hist = {e: Counter({len(e): 1}) for e in G_frozen}
-        self.simp = {}                                  # simplex -> cached local cost
-        # edge -> shared mutable box holding its owner's current key; a merge
-        # re-labels the largest operand's box in O(1) rather than
-        # re-pointing all of its faces (union-find style)
-        self.box = {e: [e] for e in G_frozen}           # object -> its box
-        self.obox = {e: self.box[e] for e in G_frozen}  # edge -> owner's box
-        self.idx = defaultdict(set)                     # node -> live objects
+        self.simp = {}  # simplex -> its local cost
+        # each hyperedge points to a shared one-element list holding its
+        # owner, so a merge can relabel the largest operand in O(1)
+        self.box = {e: [e] for e in G_frozen}
+        self.obox = {e: self.box[e] for e in G_frozen}
+        self.idx = defaultdict(set)  # node -> objects containing it
         for e in G_frozen:
             for v in e:
                 self.idx[v].add(e)
         self.Hc = Counter(len(e) for e in G_frozen)
         self.Sc = Counter()
-        # home index: every live object is filed under its rarest node (by
-        # degree in G). Objects inside a node set u are found by scanning
-        # the home lists of u's nodes, which skips hub incidences.
+        # file every object under its lowest-degree node, so objects inside
+        # a node set can be found without scanning hub nodes
         self.gdeg = {v: len(es) for v, es in self.idx.items()}
         self.home = defaultdict(set)
         for e in G_frozen:
             self.home[self._rare(e)].add(e)
-        # static strict-descendant edges, via the nestedness DAG (rarest-node scan)
+        # hyperedges strictly contained in each hyperedge
         eidx = defaultdict(list)
         for e in G_frozen:
             for v in e:
                 eidx[v].append(e)
         self.eidx = eidx
-        self.nestc = {}                                 # node set -> sizes of G-edges inside
-        self.sidx = defaultdict(set)                    # node -> live SIMPLICES (not H edges)
-        self.desc = defaultdict(list)                   # edge -> edges strictly inside it
+        self.nestc = {}  # node set -> size counts of hyperedges inside it
+        self.sidx = defaultdict(set)  # node -> simplices containing it
+        self.desc = defaultdict(list)
         for f in G_frozen:
             v0 = min(f, key=lambda v: len(eidx[v]))
             for e in eidx[v0]:
@@ -258,15 +246,14 @@ class _SetState:
 
     def nest_of(self, x):
         h = self.nestc.get(x)
-        if h is None:                     # only G edges reach here uncached
+        if h is None:
             h = Counter(len(f) for f in self.desc.get(x, ()))
             h[len(x)] += 1
             self.nestc[x] = h
         return h
 
     def nest_union(self, a, b, u):
-        """Sizes of all G-edges inside u = a|b: those inside the larger
-        operand (cached) plus edges through the nodes u adds to it."""
+        """Size counts of hyperedges inside u = a | b."""
         big = a if len(a) >= len(b) else b
         h = Counter(self.nest_of(big))
         if len(u) == len(big):
@@ -285,11 +272,9 @@ class _SetState:
         return h
 
     def nest_for(self, a, b, u, T, hist):
-        """Sizes of all G-edges inside u. Edges inside u that the merge does
-        not absorb are owned by live simplices t outside T with |t & u| >= 2,
-        because H edges inside u are absorbed. If there are none,
-        nest = hist exactly. Otherwise count those simplices' faces inside u,
-        or fall back to the incidence scan when that is cheaper."""
+        """Same as nest_union, but usually cheaper: hyperedges inside u that
+        the merge does not absorb must belong to other simplices overlapping
+        u, so only those need to be checked."""
         ov = Counter()
         sidx = self.sidx
         for v in u:
@@ -314,7 +299,7 @@ class _SetState:
         return t in self.simp
 
     def sub_objects(self, x):
-        """Live objects strictly inside x. They are empty for a simplex (invariant)."""
+        """Objects strictly inside x (none if x is a simplex)."""
         if x in self.simp:
             return ()
         out = set()
@@ -325,12 +310,9 @@ class _SetState:
         return out
 
     def cross_objects(self, a, b):
-        """Live objects inside a|b that are inside neither a nor b; each must
-        meet both a-b and b-a. Work is kept proportional to the SMALLER
-        operand (plus incidence scans), never to a giant operand's size:
-        small unions enumerate candidate node subsets directly, otherwise
-        the incidence lists of the smaller difference side (or the home
-        lists of a small union) are scanned."""
+        """Objects inside a | b but inside neither a nor b. Uses whichever
+        search is cheapest: enumerating subsets for small unions, otherwise
+        scanning node incidence lists on the smaller side."""
         if len(a) > len(b):
             a, b = b, a
         d1 = [v for v in a if v not in b]
@@ -379,13 +361,14 @@ class _SetState:
         return {t for t in cand if t <= u}
 
     def plan(self, a, b):
-        """Exact delta-L for merging a and b; returns (delta, T, hist)."""
+        """Change in L from merging a and b (absorbing everything inside
+        a | b). Returns (delta, objects removed, (hist, nest))."""
         u = a | b
         T = {a, b}
         T.update(self.sub_objects(a))
         T.update(self.sub_objects(b))
         T.update(self.cross_objects(a, b))
-        if u not in T and u in self.faces:   # u already exists as a live H edge
+        if u not in T and u in self.faces:  # u is itself a residual hyperedge
             T.add(u)
             T.update(self.sub_objects(u))
         N = self.N
@@ -417,9 +400,9 @@ class _SetState:
         return d, T, (hist, nest)
 
     def apply(self, u, T, hn):
-        """Execute a planned merge; returns an undo record. The face set and
-        owner box of the operand with the most faces are reused (stolen),
-        so the cost is proportional to the smaller operands."""
+        """Carry out a merge from plan() and return a record for undo().
+        The largest operand's face set is reused, so the cost scales with
+        the smaller operands."""
         hist, nest = hn
         self.nestc[u] = nest
         faces, idx, home = self.faces, self.idx, self.home
@@ -504,18 +487,16 @@ class _SetState:
 def set_greedy(G_frozen, N, node_pair_cap=None, hub_cap=None, budget_s=None,
                logfile=None, seed=0, nucleation_cap=2000, nucleation_bits=64.0,
                max_rounds=4):
-    """Exact greedy for the set-code objective. Returns (S, L_state).
+    """Greedy minimization of L. Returns (S, L).
 
-    Phase 1 absorbs nested hyperedges collectively into their largest
-    enclosing hyperedge. Phase 2 runs lazy best-first pair merges. Each
-    phase ends with a NUCLEATION pass. Because S and H are coded as sets,
-    the cost of a new simplex falls as more simplices of its size exist,
-    so several moves can be jointly favourable while each is individually
-    unfavourable (e.g. two disjoint triangles in a tiny graph). The pass
-    applies the best near-miss candidates (delta < nucleation_bits) in
-    ascending order of delta, re-scoring each one exactly. It keeps the
-    prefix with the lowest cumulative L and undoes the rest, so it can
-    only lower L. Rounds repeat until nothing improves (max_rounds)."""
+    Phase 1 absorbs nested hyperedges into the largest hyperedge containing
+    them. Phase 2 merges overlapping pairs best-first. Since a new simplex
+    gets cheaper when there are already simplices of the same size, a few
+    moves can lower L together even if none does alone (e.g. two disjoint
+    triangles in a tiny hypergraph). So after each phase we also try the
+    near-miss moves (delta < nucleation_bits) in order, keep the prefix that
+    gives the lowest L, and undo the rest. This repeats for up to max_rounds
+    rounds or until L stops decreasing."""
     if node_pair_cap is None or node_pair_cap == 'auto':
         node_pair_cap = NODE_PAIR_CAP
     if hub_cap is None:
@@ -533,10 +514,9 @@ def set_greedy(G_frozen, N, node_pair_cap=None, hub_cap=None, budget_s=None,
             k = _kc[t] = (len(t), tuple(sorted(map(str, t))))
         return k
     TOL = 1e-9
-    # A popped candidate whose re-scored delta is within STALE_SLACK bits of
-    # the next heap entry is executed rather than re-queued. Every move
-    # is still scored exactly; this only relaxes the best-first ORDER, so
-    # global-count drift cannot set off a re-queue cascade.
+    # accept a popped move if its updated score is within STALE_SLACK bits of
+    # the best one left in the heap, instead of pushing it back (avoids long
+    # re-queue chains; the move itself is still scored exactly)
     STALE_SLACK = 1.0
 
     def log(msg):
@@ -545,7 +525,7 @@ def set_greedy(G_frozen, N, node_pair_cap=None, hub_cap=None, budget_s=None,
             logfile.flush()
 
     def nucleate(cands, label):
-        """cands: iterable of (delta, a, b). Returns the L change (<= 0)."""
+        """Joint pass over near-miss moves (delta, a, b). Returns the change in L."""
         cands = sorted((c for c in cands if c[0] < nucleation_bits),
                        key=lambda c: (c[0], _key(c[1]), _key(c[2])))[:nucleation_cap]
         undo_log, cum, best, best_len = [], 0.0, 0.0, 0
@@ -565,7 +545,7 @@ def set_greedy(G_frozen, N, node_pair_cap=None, hub_cap=None, budget_s=None,
             log(f"  nucleation ({label}): {best_len} joint moves, dL={best:.3f}")
         return best
 
-    # ── phase 1: collective absorption into the largest enclosing edges ────
+    # phase 1: absorb nested hyperedges
     def phase1():
         dL, near, n = 0.0, [], 0
         for p in sorted(G_frozen, key=lambda t: (-len(t), _key(t)[1])):
@@ -580,10 +560,10 @@ def set_greedy(G_frozen, N, node_pair_cap=None, hub_cap=None, budget_s=None,
                 n += 1
             elif d < nucleation_bits:
                 near.append((d, p, p))
-        log(f"set-code phase 1: {n} absorptions, |S|={len(st.simp)}")
+        log(f"phase 1: {n} absorptions, |S|={len(st.simp)}")
         return dL, near
 
-    # ── phase 2: lazy best-first pair merges ────────────────────────────────
+    # phase 2: best-first pairwise merges
     def phase2():
         heap, near = [], []
         cnt = 0
@@ -644,7 +624,7 @@ def set_greedy(G_frozen, N, node_pair_cap=None, hub_cap=None, budget_s=None,
                 if d < nucleation_bits:
                     near.append((d, a, b))
                 continue
-            if heap and d > heap[0][0] + STALE_SLACK:   # stale: re-queue at its true value
+            if heap and d > heap[0][0] + STALE_SLACK:  # out of date, push back
                 cnt += 1
                 heapq.heappush(heap, (d, cnt, a, b))
                 continue
@@ -658,8 +638,8 @@ def set_greedy(G_frozen, N, node_pair_cap=None, hub_cap=None, budget_s=None,
             if n2 % 2000 == 0:
                 log(f"  phase 2: {n2} merges, |S|={len(st.simp)}, heap={len(heap)}, "
                     f"max|s|={len(u)}")
-            # re-pair: earlier partners of the absorbed objects, plus the
-            # neighbours of u with the largest overlap (capped at hub_cap)
+            # new candidates for u: old partners of the merged objects and the
+            # objects overlapping u the most (at most hub_cap)
             cand = {t for t in old_partners if t in st.faces and t != u}
             big_op = max(T, key=len)
             new_nodes = set()
@@ -679,11 +659,11 @@ def set_greedy(G_frozen, N, node_pair_cap=None, hub_cap=None, budget_s=None,
                 if scanned > 50 * hub_cap:
                     break
             cand.update(sorted(ov, key=lambda t: (-ov[t], _key(t)))[:hub_cap])
-            if len(cand) > hub_cap:     # per-union re-pairing budget
+            if len(cand) > hub_cap:
                 cand = set(sorted(cand, key=lambda t: (-ov.get(t, 0), _key(t)))[:hub_cap])
             for t in sorted(cand, key=_key):
                 push(u, t)
-        log(f"set-code phase 2: {n2} merges, |S|={len(st.simp)}")
+        log(f"phase 2: {n2} merges, |S|={len(st.simp)}")
         return dL, near
 
     for rnd in range(max_rounds):
@@ -702,7 +682,7 @@ def set_greedy(G_frozen, N, node_pair_cap=None, hub_cap=None, budget_s=None,
 
     chk = st.total()
     if abs(chk - L) > 1e-6 * max(1.0, abs(L)):
-        raise RuntimeError(f"set-code bookkeeping drift: {L} vs {chk}")
+        raise RuntimeError(f"bookkeeping error: {L} vs {chk}")
     return list(st.simp), chk
 
 
@@ -714,7 +694,7 @@ def _set_greedy_optimizer(G_list, logpath=os.devnull, N=None, budget_s=None,
     t0 = time.time()
     with open(logpath, 'w') as lf:
         L0 = set_baseline_DL(G_frozen, N)
-        lf.write(f"[set code] N={N}  E={len(G_frozen)}  L0={L0:.3f}\n")
+        lf.write(f"N={N}  E={len(G_frozen)}  L0={L0:.3f}\n")
         S, Lstate = set_greedy(G_frozen, N, node_pair_cap=node_pair_cap,
                                hub_cap=hub_cap, budget_s=budget_s, logfile=lf)
         DL = set_description_length(G_frozen, S, N)
@@ -730,32 +710,25 @@ def _set_greedy_optimizer(G_list, logpath=os.devnull, N=None, budget_s=None,
     return _finalise(G_frozen, S, DL, L0)
 
 
-
-
 greedy_optimizer = _set_greedy_optimizer
 description_length = set_description_length
 baseline_DL = set_baseline_DL
 
 
-# ── convenience wrapper ──────────────────────────────────────────────────────
-
 def decompose(edges, N=None):
-    """Decompose a hypergraph into latent simplices and residual edges.
+    """Decompose a hypergraph into latent simplices and residual hyperedges.
 
-    Parameters
-    ----------
-    edges : iterable of node collections (any hashable node labels).
-        Hyperedges of size < 2 and duplicates are dropped.
-    N : int, optional
-        Number of nodes in the ambient system (default: number of
-        distinct nodes appearing in `edges`).
+    edges: iterable of hyperedges, each a collection of hashable node labels.
+        Hyperedges with fewer than 2 nodes and duplicates are dropped.
+    N: number of nodes (defaults to the number of nodes appearing in edges).
 
-    Returns
-    -------
-    dict with keys 'S' (list of simplex node sets), 'H' (list of
-    residual hyperedges), 'F' (dict simplex -> hosted hyperedges),
-    'L' (description length, bits), 'L0' (null description length),
-    and 'eta' (compression ratio L / L0).
+    Returns a dict with
+        'S'   : list of simplices (frozensets of nodes)
+        'H'   : list of residual hyperedges
+        'F'   : dict mapping each simplex to the hyperedges it hosts
+        'L'   : description length in bits
+        'L0'  : description length of the null model
+        'eta' : compression ratio L / L0
     """
     G_list = [frozenset(e) for e in edges]
     G_list = sorted(set(e for e in G_list if len(e) >= 2),

@@ -1,75 +1,79 @@
 # Simplicial decomposition of hypergraphs
 
-Parameter-free decomposition of a hypergraph into its **simplicial
-component** — a set of latent simplices whose observed faces are more
-parsimoniously described as fragments of coherent group interactions —
-and a **residual** of independent hyperedges. The method minimizes a
+Code for decomposing a hypergraph into a set of latent simplices, whose
+observed faces are better described as parts of a single group interaction,
+and a residual set of independent hyperedges. The decomposition minimizes a
 description length derived from a Bayesian generative model (equivalently,
-performs maximum-a-posteriori inference) and has no tunable parameters.
+it is a maximum a posteriori estimate) and has no free parameters.
 
-## Contents
+Paper:
 
-- `simplicial_decomposition.py` — the complete algorithm in one file,
-  extracted verbatim from the code used for every result in the paper.
-  It needs only the Python standard library (Python >= 3.9).
-- `reproduce_fig1.py` — reproduces the paper's Fig. 1 example:
-  decomposes a small synthetic hypergraph and prints the observed
-  hypergraph, the inferred simplices with their hosted hyperedges, the
-  residual, and the compression ratio.
+> A. Kirkley and F. Battiston, *When are hypergraphs simplicial?*
+> (2026). [journal / arXiv link]
 
-## Quick start
+## Files
+
+- `simplicial_decomposition.py`: the full method in a single file. It is
+  the same code used for the results in the paper and only needs the Python
+  standard library (Python 3.9 or later).
+- `reproduce_fig1.py`: runs the example from Fig. 1 of the paper and prints
+  the hypergraph, the inferred simplices with the hyperedges they host, the
+  residual hyperedges, and the compression ratio.
+
+## Usage
 
 ```python
 from simplicial_decomposition import decompose
 
 hyperedges = [
-    {1, 2, 3, 4},          # any iterables of hashable node labels
+    {1, 2, 3, 4},
     {1, 2, 3}, {2, 3, 4},
     {1, 2}, {3, 4},
     {5, 6},
 ]
 result = decompose(hyperedges)
 
-result['S']     # inferred simplices (list of frozensets of nodes)
+result['S']     # inferred simplices (frozensets of nodes)
 result['H']     # residual hyperedges
-result['F']     # simplex -> hyperedges it hosts
-result['eta']   # compression ratio L / L0 (1.0 = no simplicial structure)
+result['F']     # hyperedges hosted by each simplex
+result['eta']   # compression ratio L / L0
 ```
 
-To reproduce Fig. 1:
+Node labels can be any hashable objects. To reproduce Fig. 1, run
 
 ```
 python reproduce_fig1.py
 ```
 
-## What the output means
+## Interpreting the output
 
-Each inferred simplex `s` is a claim that the hyperedges nested inside
-it are better explained as noisy observations of one latent group
-interaction on `s`'s nodes than as independent interactions. The
-compression ratio `eta` in (0, 1] summarizes how much simplicial
-structure the data contain (lower = more); `eta = 1` means the method
-found no evidence of simplicial structure and returned the null
-decomposition. The null description is the code of a uniformly random
-hypergraph with the observed numbers of hyperedges of each size, so
-random hypergraphs give `eta = 1`: the method abstains rather than
-hallucinating structure on random data.
+Each simplex `s` in the output means that the hyperedges inside `s` are
+better explained as noisy observations of one group interaction on the nodes
+of `s` than as separate interactions. The compression ratio `eta` lies in
+(0, 1], with lower values meaning more simplicial structure. If `eta = 1`, no
+simplicial structure was found and every hyperedge is returned as residual.
+The null model is a uniformly random hypergraph with the same number of
+hyperedges of each size, so random hypergraphs give `eta = 1`.
 
-Because the null is uniform over nodes, strongly heterogeneous node
-degrees alone can produce mild compression (for example, a large
-"simplex" of high-degree nodes). To separate simplicial structure from
-degree effects, compare `eta` with its value on a degree-preserving
-randomization of your data, e.g. one obtained by shuffling node
-incidences across hyperedges while keeping hyperedge sizes fixed.
+Since the null model treats all nodes alike, very heterogeneous degrees can
+give some compression on their own (e.g. a large simplex made of high-degree
+nodes). To check for this, compare `eta` with the value obtained on a
+degree-preserving randomization of the data, for instance one made by
+shuffling node memberships across hyperedges while keeping hyperedge sizes
+fixed.
 
-## Scaling
+## Large hypergraphs
 
-The file includes the paper's two resource budgets: a per-node
-candidate-pair budget (`SD_NODE_PAIR_CAP`, default 1000) and a
-per-object re-pairing budget (`SD_HUB_CAP`, default 100), both
-settable as environment variables. Neither engages on small or moderate
-data, and with them the method has been run on hypergraphs with close to
-10^6 hyperedges. Every move is scored by its exact change in description
-length, so the budgets can only omit candidate merges and never apply an
-unsound one. Results are deterministic.
+Two limits keep the run time manageable on large data: the number of
+candidate pairs considered per node (`SD_NODE_PAIR_CAP`, default 1000) and
+the number of new candidates considered after each merge (`SD_HUB_CAP`,
+default 100). Both can be set as environment variables. They have no effect
+on small and medium-sized hypergraphs, and with them we have run the method
+on hypergraphs with close to a million hyperedges. Since every merge is
+scored by its exact change in description length, the limits can only cause
+a merge to be missed, never a bad merge to be made. Results are
+deterministic.
 
+## Citation
+
+Please cite the paper above if you use this code.
