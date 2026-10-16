@@ -6,11 +6,6 @@ and a residual set of independent hyperedges. The decomposition minimizes a
 description length derived from a Bayesian generative model (equivalently,
 it is a maximum a posteriori estimate) and has no free parameters.
 
-Paper:
-
-> A. Kirkley and F. Battiston, *When are hypergraphs simplicial?*
-> (2026). [journal / arXiv link]
-
 ## Files
 
 - `simplicial_decomposition.py`: the full method in a single file. It is
@@ -73,7 +68,3 @@ on hypergraphs with close to a million hyperedges. Since every merge is
 scored by its exact change in description length, the limits can only cause
 a merge to be missed, never a bad merge to be made. Results are
 deterministic.
-
-## Citation
-
-Please cite the paper above if you use this code.
