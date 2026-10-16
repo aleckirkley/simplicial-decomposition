@@ -5,7 +5,7 @@ hyperedges) and print the observed hypergraph and its inferred simplicial
 decomposition.
 
 Usage:  python reproduce_fig1.py
-Dependencies: numpy (via simplicial_decomposition).
+Dependencies: Python standard library only.
 """
 from simplicial_decomposition import decompose
 

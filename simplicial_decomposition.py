@@ -4,22 +4,25 @@ simplicial_decomposition.py -- MDL simplicial decomposition of hypergraphs.
 Decomposes an observed hypergraph G into a set S of latent simplices and
 a residual set H of independent hyperedges by minimizing the description
 length (equivalently, maximizing the Bayesian posterior of the paper's
-generative model):
+generative model). Every collection is encoded as a SET, size class by
+size class:
 
-    L(S,H) = sum_{s in S} [ n(s) + log2 C(N, n(s)) ]                 (simplices)
-           + sum_{s in S} sum_{e in F(s)} log2 C(n(s), n(e))         (hosted faces)
-           + sum_{h in H} log2 C(N, n(h)),                           (residual)
+    L(S,H) = sum_j log2 C(C(N,j), |H_j|)                      (residual hyperedges)
+           + sum_j log2 C(C(N,j), |S_j|)                      (simplex node sets)
+           + sum_s [ n(s) + sum_j log2 C(C(n(s),j), |F_j(s)|) ]   (hosted faces)
 
-where n(.) counts nodes, N is the number of nodes in the system, and
-F(s) is the set of observed hyperedges hosted by simplex s. The decomposition is
-found with the two-phase greedy algorithm of the paper, consisting of a bottom-up
-collapse of the nestedness DAG (Phase 1) followed by greedy merging
-of overlapping objects (Phase 2).
+    L0     = sum_j log2 C(C(N,j), |G_j|)                      (null: uniform random hypergraph)
 
-This code includes the three resource budgets for scalability to very large networks (a
-per-node candidate-pair budget, a per-object candidate budget, and a
-memory bound under which candidate seeding switches to a MinHash-LSH
-generator).
+Here X_j counts objects of size j, n(.) counts nodes, N is the number of nodes,
+and F(s) is the set of observed hyperedges hosted by simplex s. Because the
+null is a uniform random hypergraph with G's size sequence, random
+hypergraphs give eta = L/L0 = 1.
+
+The optimizer is an exact two-phase greedy: collective absorption into
+enclosing hyperedges, then best-first merging of overlapping objects, each
+followed by a nucleation pass. Every move is scored exactly. Two resource
+budgets bound the work: a per-node candidate-pair budget and a per-object
+re-pairing budget.
 
 Quick start:
 
@@ -29,9 +32,10 @@ Quick start:
     result['H']      # residual hyperedges (list of frozensets)
     result['eta']    # compression ratio L / L0 (1.0 = no simplicial structure)
 
-Dependencies: numpy. (Python >= 3.9.)
+Dependencies: Python >= 3.9 standard library only.
 """
 
+import functools
 import heapq
 import math
 import os
@@ -40,54 +44,12 @@ import time
 import zlib
 from collections import Counter, defaultdict
 
-import numpy as np
-
-
-def loggamma(x):
-    """Natural log-gamma (stdlib; scipy-free)."""
-    return math.lgamma(x)
-
-
-SIZE_PRIOR = 'geometric'
-
-
 NODE_PAIR_CAP = int(float(os.environ.get('SD_NODE_PAIR_CAP', 1_000)))
-
-
+#   per-node seeding pair budget (seeded uniform subsample above it)
 HUB_CAP = int(float(os.environ.get('SD_HUB_CAP', 100)))
-
-
-SEED_MEM_CAP = int(float(os.environ.get('SD_SEED_MEM_CAP', 6e8)))
-
-
-PHASE2_HUB_TAU = 64
-
-
-LSH_NUM_PERM = int(float(os.environ.get('SD_LSH_NUM_PERM', 25)))
-
-
-LSH_THRESHOLD = float(os.environ.get('SD_LSH_THRESHOLD', 0.5))
-
+#   per-object re-pairing budget after each merge
 
 last_run_info = {}
-
-
-def _size_prior_on():
-    return SIZE_PRIOR == 'geometric'
-
-
-def logchoose(n,k):
-    """
-    log binomial coefficient
-    """
-    return loggamma(n+1) - loggamma(k+1) - loggamma(n-k+1)
-
-
-def _logchoose(n, k):
-    """log2 C(n, k)"""
-    if k < 0 or k > n:
-        return float('inf')
-    return logchoose(n, k) / math.log(2)
 
 
 def _enclosing_key(s):
@@ -127,26 +89,6 @@ def _assign_faces(G_frozen, S):
     return faces_assigned, covered
 
 
-def description_length(G_frozen, S, N):
-    """Computes full description length objective L(S, H)."""
-    S = list(S)
-    faces_assigned, covered = _assign_faces(G_frozen, S)
-    H = G_frozen - covered
-    dl = (sum(_logchoose(N, len(h)) for h in H)
-          + sum(_logchoose(N, len(s)) + sum(_logchoose(len(s), len(e)) for e in faces_assigned[s])
-                for s in S))
-    if _size_prior_on():
-        # geometric size prior: n(s) bits per non-singleton simplex.
-        dl += sum(len(s) for s in S if set(faces_assigned[s]) != {s})
-    return dl
-
-
-def baseline_DL(G_frozen, N):
-    """L0: description length when every edge is isolated (no simplices,
-    S = empty set)"""
-    return sum(_logchoose(N, len(e)) for e in G_frozen)
-
-
 def _finalise(G_frozen, S, DL, L0):
     """Drop neutral singletons (A(s) = {s}), then return
     (S, H, DL, eta)."""
@@ -157,930 +99,642 @@ def _finalise(G_frozen, S, DL, L0):
     return S, H, DL, DL / L0 if L0 > 0 else float('nan')
 
 
-def _build_nestedness_dag(G_list):
-    """Return child -> set-of-direct-parents in the nestedness partial order
-    (h1 -> h2 when h1 is a proper subset of h2, with no intermediate
-    hyperedge in G).
-    """
+_LN2 = math.log(2)
+
+
+@functools.lru_cache(maxsize=1 << 20)
+def _lc(n, k):
+    """log2 C(n, k) (float n allowed only via _lcc)."""
+    if k < 0 or k > n:
+        return float('inf')
+    return (math.lgamma(n + 1) - math.lgamma(k + 1) - math.lgamma(n - k + 1)) / _LN2
+
+
+def _lfact2(k):
+    return math.lgamma(k + 1) / _LN2
+
+
+@functools.lru_cache(maxsize=1 << 20)
+def _lcc(n, j, k):
+    """log2 C(C(n, j), k): bits to name a k-subset of the j-subsets of n nodes."""
+    if k == 0:
+        return 0.0
+    lx = _lc(n, j)
+    if lx < 40:                                   # X = C(n,j) < ~1e12: exact
+        X = math.comb(n, j)
+        if k > X:
+            return float('inf')
+        if k <= 256:
+            return (sum(math.log(X - i) for i in range(k))
+                    - math.lgamma(k + 1)) / _LN2
+        return (math.lgamma(X + 1) - math.lgamma(k + 1)
+                - math.lgamma(X - k + 1)) / _LN2
+    # X >= 1e12: log (X)_k = k log X + sum_i log(1 - i/X), two-term expansion
+    if lx > 900:                                  # corrections < 1e-200 bits
+        return k * lx - _lfact2(k)
+    X = 2.0 ** lx
+    s1 = k * (k - 1) / 2.0
+    s2 = (k - 1) * k * (2 * k - 1) / 6.0
+    return k * lx - (s1 / X + s2 / (2 * X * X)) / _LN2 - _lfact2(k)
+
+
+def set_local_cost(n, hist, nest=None):
+    """Per-simplex cost: n bits + set code of its faces, size class by size class.
+
+    hist: sizes of the faces this simplex hosts (smallest-enclosing rule).
+    nest: sizes of ALL observed hyperedges nested in the simplex. Faces in an
+    overlap with a smaller simplex are hosted there, but G is the union of
+    what the simplices emit, so this simplex may also emit them. Since
+    log C(X, k) is concave in k, emitting all of them or none is optimal in
+    each size class, so the class costs min(code(k_own), code(k_nested))."""
+    if nest is None:
+        return n + sum(_lcc(n, j, c) for j, c in hist.items() if c)
+    L = n
+    for j, k in nest.items():
+        if not k:
+            continue
+        c = hist.get(j, 0)
+        a = _lcc(n, j, c)
+        if k > c:
+            b = _lcc(n, j, k)
+            if b < a:
+                a = b
+        L += a
+    return L
+
+
+def set_global_cost(N, Hc, Sc):
+    return (sum(_lcc(N, j, c) for j, c in Hc.items() if c)
+            + sum(_lcc(N, j, c) for j, c in Sc.items() if c))
+
+
+def set_baseline_DL(G_frozen, N):
+    return set_global_cost(N, Counter(len(e) for e in G_frozen), Counter())
+
+
+def set_description_length(G_frozen, S, N):
+    """L(S, H) under the set code, with the manuscript's assignment rule
+    (each edge is hosted by its smallest enclosing simplex; ties are broken
+    by _enclosing_key; a simplex whose only face is itself is an isolated
+    edge). Enclosing simplices may also emit overlap faces (set_local_cost)."""
+    S = list(S)
+    faces_assigned, covered = _assign_faces(G_frozen, S)
+    Hc = Counter(len(e) for e in G_frozen if e not in covered)
+    Sc = Counter()
+    real = []
+    for s in S:
+        fa = faces_assigned.get(s, [])
+        if not fa:
+            continue                      # a simplex with no faces is not part of the model
+        if len(fa) == 1 and fa[0] == s:
+            Hc[len(s)] += 1               # singleton = isolated edge
+            continue
+        real.append(s)
+    nest = {s: Counter() for s in real}
     node_index = defaultdict(set)
-    for h in G_list:
-        for v in h:
-            node_index[v].add(h)
-
-    parents = {}
-    for h1 in G_list:
-        if not h1:
-            parents[h1] = set()
-            continue
-        it = iter(h1)
-        candidates = set(node_index[next(it)])
+    for s in real:
+        for v in s:
+            node_index[v].add(s)
+    for e in covered:
+        it = iter(e)
+        cand = set(node_index.get(next(it), ()))
         for v in it:
-            candidates &= node_index[v]
-        candidates.discard(h1)
-        parents[h1] = {h2 for h2 in candidates if h1 < h2}
-
-    # Hasse reduction: keep only the minimal parents under the subset order. 
-    direct = {}
-    for child, pars in parents.items():
-        kept = []
-        for p in sorted(pars, key=_enclosing_key):
-            if not any(q < p for q in kept):
-                kept.append(p)
-        direct[child] = set(kept)
-    return direct
+            cand &= node_index.get(v, set())
+        for s in cand:
+            if e <= s:
+                nest[s][len(e)] += 1
+    L = 0.0
+    for s in real:
+        Sc[len(s)] += 1
+        L += set_local_cost(len(s), Counter(len(e) for e in faces_assigned[s]), nest[s])
+    return L + set_global_cost(N, Hc, Sc)
 
 
-def phase1(G_frozen, N, logfile=None):
-    """Bottom-up DAG collapse, absorbing each edge into
-    whichever direct parent yields the most-negative re-encoding gain.
-    Parents are iterated in a fixed deterministic order (size, then sorted
-    node tuple), and all viable parents are evaluated before committing to
-    the one with the smallest delta.
-    """
-    G_list = list(G_frozen)
-    sfm = {h: frozenset({h}) for h in G_list}
-    dag = _build_nestedness_dag(G_list)
-    # Per-simplex face-SIZE histograms
-    hist = {h: Counter((len(h),)) for h in G_list}
-    _sp = _size_prior_on()
-    for h in sorted(G_list, key=_enclosing_key):
-        if h not in sfm:
-            continue
-        Gh = sfm[h]
-        n_h = len(h)
-        hist_h = hist[h]
-        base = -_logchoose(N, n_h)
-        if _sp and sum(hist_h.values()) > 1:
-            # geometric size prior: h's own (non-singleton) simplex, and
-            # its n(h)-bit size cost, disappear on absorption
-            base -= n_h
-        self_costs = {j: _logchoose(n_h, j) for j in hist_h}
-        best_delta, best_hpar = 0.0, None
-        for hpar in sorted(dag.get(h, set()), key=_enclosing_key):
-            if hpar not in sfm:
-                continue
-            n_p = len(hpar)
-            delta = base + sum(c * (_logchoose(n_p, j) - self_costs[j])
-                               for j, c in hist_h.items())
-            if _sp and sum(hist[hpar].values()) == 1:
-                # the parent was a singleton and becomes a real simplex,
-                # incurring its n(p)-bit size cost
-                delta += n_p
-            if logfile:
-                logfile.write(f"Phase1: {sorted(h)} -> {sorted(hpar)}  delta={delta:.3f}\n")
-            if delta < best_delta:
-                best_delta, best_hpar = delta, hpar
-        if best_hpar is not None:
-            sfm[best_hpar] = sfm.get(best_hpar, frozenset()) | Gh
-            hist[best_hpar] = hist.get(best_hpar, Counter()) + hist_h
-            del sfm[h]
-    return sfm
+class _SetState:
+    """Exact face-map state for the set-code objective."""
 
-
-def phase2(simplex_faces_map, G_frozen, N, logfile=None,
-           approx=False, hub_cap=None, size_cap=None,
-           lsh_num_perm=None, lsh_threshold=None,
-           stochastic_eps=0.0, theta=0.0, budget_s=None,
-           node_pair_cap=None):
-    """Intersection-graph greedy merges via min-heap ("Phase 2")."""
-    if hub_cap is None:
-        hub_cap = HUB_CAP
-    if lsh_num_perm is None:
-        lsh_num_perm = LSH_NUM_PERM
-    if lsh_threshold is None:
-        lsh_threshold = LSH_THRESHOLD
-    heap = []
-    valid = {}                          # pair-key (frozenset) -> delta
-    s_pairs = {}                        # simplex -> set of pair-keys it appears in
-
-    edge_index = defaultdict(set)       # node -> incident edges of G_frozen (fixed)
-    for e in G_frozen:
-        for v in e:
-            edge_index[v].add(e)
-    deg = {v: len(es) for v, es in edge_index.items()}
-    kmax = max((len(e) for e in G_frozen), default=0)
-    # per-node allowance for the cross-edge charge
-    nodeCrossN = {v: sum(_logchoose(N, len(e)) for e in es)
-                  for v, es in edge_index.items()}
-
-    # ── per-simplex incremental state ────────────────────────────────────────
-    sfm = {}          # simplex -> owned (A(s)) as a mutable set
-    nested = {}       # simplex -> all G-edges contained in s (mutable set)
-    histN = {}        # simplex -> Counter of nested face sizes
-    nestN_c = {}      # simplex -> sum logC(N, n(e)) over nested
-    ownN_c = {}       # simplex -> sum logC(N, n(e)) over owned
-    ownSelf_c = {}    # simplex -> sum logC(n(s), n(e)) over owned
-    degsum = {}       # simplex -> sum of node degrees (for the cross bound)
-    sxc = {}          # simplex -> sum of nodeCrossN over the simplex's nodes
-
-    # node -> live simplices index; maintained incrementally through merges
-    simplex_index = defaultdict(set)
-    for s in simplex_faces_map:
-        for v in s:
-            simplex_index[v].add(s)
-
-    for s, faces in simplex_faces_map.items():
-        sfm[s] = set(faces)
-        nested[s] = set()
-        s_pairs[s] = set()
-
-    # ── nested-set initialization ───────────────────────────────────────────
-    # For each edge, scan only the simplex list of its rarest node: any
-    # simplex containing the edge appears there.
-    for e in G_frozen:
-        v_star = min(e, key=lambda v: len(simplex_index.get(v, ())))
-        for t in simplex_index.get(v_star, ()):
-            if e <= t:
-                nested[t].add(e)
-
-    for s in simplex_faces_map:
-        own = sfm[s]
-        histN[s] = Counter(len(e) for e in nested[s])
-        n_s = len(s)
-        nestN_c[s] = sum(c * _logchoose(N, j) for j, c in histN[s].items())
-        hA = Counter(len(e) for e in own)
-        ownN_c[s] = sum(c * _logchoose(N, j) for j, c in hA.items())
-        ownSelf_c[s] = sum(c * _logchoose(n_s, j) for j, c in hA.items())
-        degsum[s] = sum(deg.get(v, 0) for v in s)
-        sxc[s] = sum(nodeCrossN.get(v, 0.0) for v in s)
-
-    # ── phase-2 entry invariant ─────────────────────────────────────────────
-    # The merge deltas below charge every nested face not owned by an
-    # operand at its isolated cost, which is exact only when the owner is
-    # a singleton. Absorb every real simplex nested inside another live
-    # object into its smallest enclosing object.
-    _forced = 0
-    for s in sorted(list(sfm), key=lambda t: (len(t), _enclosing_key(t))):
-        if s not in sfm or len(sfm[s]) <= 1:
-            continue
-        v_star = min(s, key=lambda v: len(simplex_index.get(v, ())))
-        hosts = [t for t in simplex_index.get(v_star, ())
-                 if t is not s and s < t]
-        if not hosts:
-            continue
-        t = min(hosts, key=lambda h: (len(h), _enclosing_key(h)))
-        moved = sfm.pop(s)
-        n_t = len(t)
-        sfm[t] = set(sfm[t]) | moved
-        hM = Counter(len(e) for e in moved)
-        ownN_c[t] += sum(c * _logchoose(N, j) for j, c in hM.items())
-        ownSelf_c[t] += sum(c * _logchoose(n_t, j) for j, c in hM.items())
-        # nested[t] / histN[t] already contain these faces (G-edge based)
-        for v in s:
-            simplex_index[v].discard(s)
-        for dd in (nested, histN, nestN_c, ownN_c, ownSelf_c, degsum, sxc):
-            dd.pop(s, None)
-        s_pairs.pop(s, None)
-        _forced += 1
-    if _forced and logfile:
-        logfile.write(f"Phase2 entry: force-absorbed {_forced} real nested "
-                      f"simplices (bookkeeping invariant)\n")
-
-    # ── collective absorption pass ──────────────────────────────────────────
-    # A singleton parent's first absorption pays its full size cost, so
-    # phase 1 declines children one at a time even when absorbing them
-    # jointly is favorable. For each inclusion-maximal singleton parent,
-    # absorb all nested singleton children iff the joint delta is negative.
-    _coll = 0
-    _sp_on = _size_prior_on()
-    for p in sorted(list(sfm), key=lambda t: (len(t), _enclosing_key(t))):
-        if p not in sfm or len(sfm[p]) != 1:
-            continue
-        # inclusion-maximal live parents only: children of non-maximal
-        # parents are collected by their enclosing parent later in the sweep
-        v_star = min(p, key=lambda v: len(simplex_index.get(v, ())))
-        if any(t is not p and p < t for t in simplex_index.get(v_star, ())):
-            continue
-        kids = [e for e in nested[p]
-                if e != p and e in sfm and len(sfm[e]) == 1]
-        if not kids:
-            continue
-        n_p = len(p)
-        total = (n_p if _sp_on else 0) + sum(
-            _logchoose(n_p, len(e)) - _logchoose(N, len(e)) for e in kids)
-        if total >= 0:
-            continue
-        moved = set(kids)
-        hM = Counter(len(e) for e in moved)
-        ownN_c[p] += sum(c * _logchoose(N, j) for j, c in hM.items())
-        ownSelf_c[p] += sum(c * _logchoose(n_p, j) for j, c in hM.items())
-        sfm[p] = set(sfm[p]) | moved
-        for e in kids:
+    def __init__(self, G_frozen, N):
+        self.N = N
+        self.G = G_frozen
+        self.faces = {e: {e} for e in G_frozen}          # object -> owned edges
+        self.hist = {e: Counter({len(e): 1}) for e in G_frozen}
+        self.simp = {}                                  # simplex -> cached local cost
+        # edge -> shared mutable box holding its owner's current key; a merge
+        # re-labels the largest operand's box in O(1) rather than
+        # re-pointing all of its faces (union-find style)
+        self.box = {e: [e] for e in G_frozen}           # object -> its box
+        self.obox = {e: self.box[e] for e in G_frozen}  # edge -> owner's box
+        self.idx = defaultdict(set)                     # node -> live objects
+        for e in G_frozen:
             for v in e:
-                simplex_index[v].discard(e)
-            for dd in (sfm, nested, histN, nestN_c, ownN_c, ownSelf_c,
-                       degsum, sxc):
-                dd.pop(e, None)
-            s_pairs.pop(e, None)
-        _coll += len(kids)
-    if _coll and logfile:
-        logfile.write(f"Phase2 entry: collectively absorbed {_coll} nested "
-                      f"singletons into their maximal singleton parents\n")
+                self.idx[v].add(e)
+        self.Hc = Counter(len(e) for e in G_frozen)
+        self.Sc = Counter()
+        # home index: every live object is filed under its rarest node (by
+        # degree in G). Objects inside a node set u are found by scanning
+        # the home lists of u's nodes, which skips hub incidences.
+        self.gdeg = {v: len(es) for v, es in self.idx.items()}
+        self.home = defaultdict(set)
+        for e in G_frozen:
+            self.home[self._rare(e)].add(e)
+        # static strict-descendant edges, via the nestedness DAG (rarest-node scan)
+        eidx = defaultdict(list)
+        for e in G_frozen:
+            for v in e:
+                eidx[v].append(e)
+        self.eidx = eidx
+        self.nestc = {}                                 # node set -> sizes of G-edges inside
+        self.sidx = defaultdict(set)                    # node -> live SIMPLICES (not H edges)
+        self.desc = defaultdict(list)                   # edge -> edges strictly inside it
+        for f in G_frozen:
+            v0 = min(f, key=lambda v: len(eidx[v]))
+            for e in eidx[v0]:
+                if len(e) > len(f) and f < e:
+                    self.desc[e].append(f)
 
-    def _candidates(node_set):
-        cands = set()
-        for v in node_set:
-            cands |= simplex_index.get(v, set())
-        return cands
+    def _rare(self, t):
+        g = self.gdeg
+        return min(t, key=lambda v: (g[v], str(v)))
 
-    # Overlap-neighbor sets, maintained incrementally:
-    # nbrs[union] = nbrs[s1] | nbrs[s2], filtered for liveness at use.
-    # Only neighbors through LIGHT nodes (simplex-degree <= PHASE2_HUB_TAU)
-    # are stored; neighbors through heavy nodes are resolved on demand
-    # from simplex_index.
-    heavy_nodes = {v for v, ts in simplex_index.items()
-                   if len(ts) > PHASE2_HUB_TAU}
-    hnodes = {s: frozenset(v for v in s if v in heavy_nodes) for s in sfm}
-    nbrs = {s: set() for s in sfm}
-    for v, ts in simplex_index.items():
-        if v in heavy_nodes or len(ts) < 2:
-            continue
-        tl = list(ts)
-        for a in tl:
-            nb = nbrs[a]
-            for b in tl:
-                if b is not a:
-                    nb.add(b)
+    def nest_of(self, x):
+        h = self.nestc.get(x)
+        if h is None:                     # only G edges reach here uncached
+            h = Counter(len(f) for f in self.desc.get(x, ()))
+            h[len(x)] += 1
+            self.nestc[x] = h
+        return h
 
-    # canonical sort key per simplex, cached
-    _key_cache = {}
-    def _ckey(s):
-        k = _key_cache.get(s)
-        if k is None:
-            k = _enclosing_key(s)
-            _key_cache[s] = k
-        return k
-
-    _sp = _size_prior_on()
-
-    def _sp_term(s1, s2, u):
-        """Geometric-size-prior contribution to the merge delta: the union
-        always pays its n(u)-bit size cost; each operand's size cost is
-        recovered only if it was a real (non-singleton) simplex."""
-        return (u - (len(s1) if len(sfm[s1]) > 1 else 0)
-                  - (len(s2) if len(sfm[s2]) > 1 else 0))
-
-    def _l1_seed_excluded(a, b):
-        """Single-overlap candidate restriction, applied
-        UNIFORMLY at seeding and at post-merge re-pairing: for |a & b| == 1
-        the exactly computable part of the delta (everything except the
-        cross-edge credit) decides candidacy; returns True when the pair
-        is excluded. Uses only per-simplex scalars, O(k)."""
-        n1, n2 = len(a), len(b)
-        u = n1 + n2 - 1
-        C0 = _logchoose(N, u) - _logchoose(N, n1) - _logchoose(N, n2)
-        U1 = sum(c * _logchoose(u, j) for j, c in histN[a].items())
-        U2 = sum(c * _logchoose(u, j) for j, c in histN[b].items())
-        excl = (C0 + U1 + U2
-                - ownSelf_c[a] - ownSelf_c[b]
-                - (nestN_c[a] - ownN_c[a]) - (nestN_c[b] - ownN_c[b]))
-        if _sp:
-            excl += _sp_term(a, b, u)
-        return excl >= 0
-
-    def _cross_terms(s1, s2, len_d1, len_d2):
-        """Edges contained in s1 | s2 but nested in neither operand (they
-        necessarily meet both node-differences, so enumerating candidates
-        from EITHER difference side yields the same set exactly; the side
-        with fewer nodes is chosen purely for speed, and only that side's
-        node list is ever materialized -- building the larger side's list,
-        or degree sums over it, dominated profiles when one operand covers
-        most of the graph). Containment in the union is tested against the
-        two operand node-sets directly, avoiding materializing the
-        (possibly very large) union set on every candidate evaluation."""
-        if len_d1 <= len_d2:
-            diff = [v for v in s1 if v not in s2]
-        else:
-            diff = [v for v in s2 if v not in s1]
-        n1_set, n2_set = nested[s1], nested[s2]
+    def nest_union(self, a, b, u):
+        """Sizes of all G-edges inside u = a|b: those inside the larger
+        operand (cached) plus edges through the nodes u adds to it."""
+        big = a if len(a) >= len(b) else b
+        h = Counter(self.nest_of(big))
+        if len(u) == len(big):
+            return h
         seen = set()
-        out = []
-        for v in diff:
-            for e in edge_index.get(v, ()):
-                if e in seen:
+        eidx = self.eidx
+        for v in u:
+            if v in big:
+                continue
+            for f in eidx[v]:
+                if f in seen:
                     continue
-                seen.add(e)
-                if e in n1_set or e in n2_set:
-                    continue
-                for w in e:
-                    if w not in s1 and w not in s2:
-                        break
-                else:
-                    out.append(e)
+                seen.add(f)
+                if f <= u:
+                    h[len(f)] += 1
+        return h
+
+    def nest_for(self, a, b, u, T, hist):
+        """Sizes of all G-edges inside u. Edges inside u that the merge does
+        not absorb are owned by live simplices t outside T with |t & u| >= 2,
+        because H edges inside u are absorbed. If there are none,
+        nest = hist exactly. Otherwise count those simplices' faces inside u,
+        or fall back to the incidence scan when that is cheaper."""
+        ov = Counter()
+        sidx = self.sidx
+        for v in u:
+            for t in sidx.get(v, ()):
+                if t not in T:
+                    ov[t] += 1
+        cands = [t for t, c in ov.items() if c >= 2]
+        if not cands:
+            return Counter(hist)
+        work = sum(len(self.faces[t]) for t in cands)
+        scan = sum(self.gdeg.get(v, 0) for v in u if v not in (a if len(a) >= len(b) else b))
+        if work > 2 * scan:
+            return self.nest_union(a, b, u)
+        h = Counter(hist)
+        for t in cands:
+            for f in self.faces[t]:
+                if f <= u:
+                    h[len(f)] += 1
+        return h
+
+    def is_simplex(self, t):
+        return t in self.simp
+
+    def sub_objects(self, x):
+        """Live objects strictly inside x. They are empty for a simplex (invariant)."""
+        if x in self.simp:
+            return ()
+        out = set()
+        for f in self.desc.get(x, ()):
+            t = self.obox[f][0]
+            if t is not x and t <= x:
+                out.add(t)
         return out
 
-    def _delta(s1, s2):
-        """Exact merge delta (Eq. delta-ss, same semantics as before)."""
-        n1, n2 = len(s1), len(s2)
-        small, big = (s1, s2) if n1 <= n2 else (s2, s1)
-        inter = [v for v in small if v in big]
-        u = n1 + n2 - len(inter)
-        C0 = _logchoose(N, u) - _logchoose(N, n1) - _logchoose(N, n2)
-        U1 = sum(c * _logchoose(u, j) for j, c in histN[s1].items())
-        U2 = sum(c * _logchoose(u, j) for j, c in histN[s2].items())
+    def cross_objects(self, a, b):
+        """Live objects inside a|b that are inside neither a nor b; each must
+        meet both a-b and b-a. Work is kept proportional to the SMALLER
+        operand (plus incidence scans), never to a giant operand's size:
+        small unions enumerate candidate node subsets directly, otherwise
+        the incidence lists of the smaller difference side (or the home
+        lists of a small union) are scanned."""
+        if len(a) > len(b):
+            a, b = b, a
+        d1 = [v for v in a if v not in b]
+        if not d1:
+            return ()
+        n_sh = len(a) - len(d1)
+        if len(b) == n_sh:
+            return ()
+        nu = len(b) + len(d1)
+        idx = self.idx
+        c1 = sum(map(len, map(idx.__getitem__, d1)))
+        side, est = d1, c1
+        if len(b) <= 2000:
+            d2 = [v for v in b if v not in a]
+            c2 = sum(map(len, map(idx.__getitem__, d2)))
+            if c2 < c1:
+                side, est = d2, c2
+            if nu <= 20:
+                n_sub = (1 << nu) - (1 << len(a)) - (1 << len(b)) + (1 << n_sh)
+                if 4 * n_sub < est:
+                    faces = self.faces
+                    shared = [v for v in a if v in b]
 
-        # ── exact evaluation ──────────────────────────────────────────────
-        nsm, nbg = (nested[s1], nested[s2])
-        if len(nsm) > len(nbg):
-            nsm, nbg = nbg, nsm
-        own1, own2 = sfm[s1], sfm[s2]
-        sharedU = sharedN = sharedA_N = 0.0
-        # |s1 & s2| <= 1: no hyperedge fits inside the intersection, so the
-        # shared-face terms vanish and the scan is skipped
-        for e in (nsm if len(inter) > 1 else ()):
-            if e in nbg:
-                j = len(e)
-                sharedU += _logchoose(u, j)
-                sharedN += _logchoose(N, j)
-                if e in own1 and e in own2:
-                    sharedA_N += _logchoose(N, j)
-        # each cross edge lowers delta by at most logC(N, n(e)): if
-        # delta_wo - allowance >= 0 the pair provably cannot merge
-        delta_wo = (C0 + U1 + U2 - sharedU
-                    - ownSelf_c[s1] - ownSelf_c[s2]
-                    - (nestN_c[s1] + nestN_c[s2] - sharedN
-                       - ownN_c[s1] - ownN_c[s2] + sharedA_N))
-        if _sp:
-            delta_wo += _sp_term(s1, s2, u)
-        sxcInt = sum(nodeCrossN.get(v, 0.0) for v in inter)
-        allow = min(sxc[s1], sxc[s2]) - sxcInt
-        if delta_wo - allow >= 0:
-            return None
+                    def subsets(lst):
+                        r = [()]
+                        for v in lst:
+                            r = r + [x + (v,) for x in r]
+                        return r
+                    S1, S2, S0 = subsets(d1)[1:], subsets(d2)[1:], subsets(shared)
+                    out = set()
+                    for x1 in S1:
+                        for x2 in S2:
+                            for x0 in S0:
+                                t = frozenset(x1 + x2 + x0)
+                                if t in faces:
+                                    out.add(t)
+                    return out
+        u = a | b
+        if nu <= 256:
+            home = self.home
+            ch = sum(map(len, map(home.__getitem__, u)))
+            if ch < est:
+                cand = set().union(*(home[v] for v in u))
+                return {t for t in cand if t <= u and not t <= a and not t <= b}
+        cand = set().union(*(idx[v] for v in side))
+        return {t for t in cand if t <= u}
 
-        crossU = crossN = 0.0
-        _il = len(inter)
-        for e in _cross_terms(s1, s2, n1 - _il, n2 - _il):
-            j = len(e)
-            crossU += _logchoose(u, j)
-            crossN += _logchoose(N, j)
-        return delta_wo + crossU - crossN
-
-    def _push(s1, s2):
-        d = _delta(s1, s2)
-        key = frozenset({s1, s2})
-        if d is None:
-            # provably never merges in the current state; clear any stale
-            # entry for this key
-            if valid.pop(key, None) is not None:
-                s_pairs.get(s1, set()).discard(key)
-                s_pairs.get(s2, set()).discard(key)
-            return
-        valid[key] = d
-        s_pairs.setdefault(s1, set()).add(key)
-        s_pairs.setdefault(s2, set()).add(key)
-        heapq.heappush(heap, (d, s1, s2))
-
-    def _invalidate(s):
-        for key in list(s_pairs.get(s, ())):
-            valid.pop(key, None)
-            for t in key:
-                if t != s:
-                    s_pairs.get(t, set()).discard(key)
-        s_pairs.pop(s, None)
-
-    def _drop_state(s):
-        for dd in (sfm, nested, histN, nestN_c, ownN_c, ownSelf_c, degsum, sxc):
-            dd.pop(s, None)
-
-    # ── initial heap ────────────────────────────────────────────────────────
-    # A sound vectorized lower bound on the merge delta is evaluated for
-    # all overlapping pairs; only pairs whose bound is negative get an
-    # exact delta and a heap entry (exact pruning, deterministic order).
-    surv = sorted(sfm, key=_ckey)
-    S0 = len(surv)
-
-    def _seed_pair_filtered(a, b):
-        """Common candidate filter: skip non-overlapping pairs; apply the
-        single-overlap restriction uniformly; otherwise push."""
-        small_op, big_op = (a, b) if len(a) <= len(b) else (b, a)
-        ov = 0
-        for v in small_op:
-            if v in big_op:
-                ov += 1
-                if ov > 1:
-                    break
-        if ov == 0:
-            return
-        if ov == 1 and _l1_seed_excluded(a, b):
-            return
-        _push(a, b)
-
-    # the optional wall-clock budget counts seeding as well; stopping
-    # early only removes candidates
-    _t_start = time.time()
-    _seed_deadline = (_t_start + budget_s) if budget_s is not None else None
-
-    if approx:
-        # ── approximate seeding: MinHash-LSH + nestedness parents ───────────────
-        # Candidates come from LSH band collisions over node-set signatures
-        # plus each survivor's direct nested supersets; every candidate is
-        # still scored with the exact delta. Hub buckets capped at hub_cap.
-        rng_lsh = np.random.RandomState(0)
-        node_ids = {v: i for i, v in enumerate(edge_index.keys())}
-        P_MOD = (1 << 61) - 1
-        a_h = rng_lsh.randint(1, P_MOD, size=lsh_num_perm, dtype=np.int64)
-        b_h = rng_lsh.randint(0, P_MOD, size=lsh_num_perm, dtype=np.int64)
-        # choose (bands, rows) with collision threshold ~ (1/bands)^(1/rows)
-        best_br = (lsh_num_perm, 1)
-        best_err = float('inf')
-        for r_rows in range(1, lsh_num_perm + 1):
-            if lsh_num_perm % r_rows:
-                continue
-            b_bands = lsh_num_perm // r_rows
-            thr = (1.0 / b_bands) ** (1.0 / r_rows)
-            if abs(thr - lsh_threshold) < best_err:
-                best_err = abs(thr - lsh_threshold)
-                best_br = (b_bands, r_rows)
-        b_bands, r_rows = best_br
-        sigs = np.empty((S0, lsh_num_perm), dtype=np.int64)
-        for i, sv in enumerate(surv):
-            ids = np.fromiter((node_ids[v] for v in sv), dtype=np.int64,
-                              count=len(sv))
-            sigs[i] = ((a_h[None, :] * ids[:, None] + b_h[None, :])
-                       % P_MOD).min(axis=0)
-        seen_pairs = set()
-        cand_list = []
-        for bnd in range(b_bands):
-            buckets = {}
-            block = sigs[:, bnd * r_rows:(bnd + 1) * r_rows]
-            for i in range(S0):
-                buckets.setdefault(block[i].tobytes(), []).append(i)
-            for members in buckets.values():
-                if len(members) < 2:
-                    continue
-                if len(members) > hub_cap:
-                    members = sorted(members)[:hub_cap]
-                for ai in range(len(members)):
-                    for bi in range(ai + 1, len(members)):
-                        kpr = (members[ai], members[bi])
-                        if kpr not in seen_pairs:
-                            seen_pairs.add(kpr)
-                            cand_list.append(kpr)
-        # nestedness parents among survivors (rarest-node containment scan);
-        # skip nodes whose survivor list is very large (candidates lost only)
-        _nested_scan_cap = 64 * hub_cap
-        surv_pos_l = {sv: i for i, sv in enumerate(surv)}
-        for i, sv in enumerate(surv):
-            v_star = min(sv, key=lambda v: len(simplex_index.get(v, ())))
-            lst = simplex_index.get(v_star, ())
-            if len(lst) > _nested_scan_cap:
-                continue
-            for t in lst:
-                if t is not sv and sv < t:
-                    j = surv_pos_l[t]
-                    kpr = (min(i, j), max(i, j))
-                    if kpr not in seen_pairs:
-                        seen_pairs.add(kpr)
-                        cand_list.append(kpr)
-        cand_list.sort()
-        for _ci, (i, j) in enumerate(cand_list):
-            if (_seed_deadline is not None and (_ci & 2047) == 0
-                    and time.time() > _seed_deadline):
-                if logfile:
-                    logfile.write("BUDGET: seeding truncated at %d/%d "
-                                  "candidates\n" % (_ci, len(cand_list)))
-                break
-            _seed_pair_filtered(surv[i], surv[j])
-    elif S0 < 300:
-        seen_pairs = set()
-        for s in surv:
-            for other in sorted(_candidates(s) - {s}, key=_ckey):
-                key = frozenset({s, other})
-                if key in seen_pairs:
-                    continue
-                seen_pairs.add(key)
-                ov = len(s & other)
-                if ov == 0:
-                    continue
-                if ov == 1 and _l1_seed_excluded(s, other):
-                    continue
-                _push(s, other)
-    else:
-        # ── pair accumulation over overlapping pairs only ───────────────────────
-        # For each node, the survivor pairs through it are generated as index
-        # arrays and grouped with np.unique, so cost is proportional to
-        # sum_v C(d_v, 2).
-        n_arr = np.array([len(sv) for sv in surv], dtype=np.int64)
-        oS = np.array([ownSelf_c[sv] for sv in surv])
-        oN = np.array([ownN_c[sv] for sv in surv])
-        nN = np.array([nestN_c[sv] for sv in surv])
-        ds = np.array([degsum[sv] for sv in surv])
-        sx = np.array([sxc[sv] for sv in surv])
-        # size-prior bookkeeping: operand size cost recovered only for
-        # non-singleton operands (see _sp_term)
-        spn = (n_arr * np.array([len(sfm[sv]) > 1 for sv in surv])
-               if _sp else np.zeros_like(n_arr))
-        surv_pos = {sv: i for i, sv in enumerate(surv)}
-        kk = kmax
-        u_max = int(2 * n_arr.max())
-        LCu = np.zeros((u_max + 1, kk + 1))
-        for u in range(u_max + 1):
-            for j in range(min(u, kk) + 1):
-                LCu[u, j] = _logchoose(u, j)
-        LCNu = np.array([_logchoose(N, u) for u in range(u_max + 1)])
-        LCNj = np.array([_logchoose(N, j) for j in range(kk + 1)])
-        Hm = np.zeros((S0, kk + 1))
-        for i, sv in enumerate(surv):
-            for j, c in histN[sv].items():
-                Hm[i, j] = c
-        Utab = Hm @ LCu.T                       # S0 x (u_max+1)
-        jm = np.minimum(np.arange(u_max + 1), kk)
-        maxdec = LCNj[jm] - LCu[np.arange(u_max + 1), jm]
-        # per-node pair generation: for each node, the survivors through it
-        # (as sorted row indices), pairs via triu indices
-        chunks_i, chunks_j, chunks_w = [], [], []
-        for v, simps_v in simplex_index.items():
-            d = len(simps_v)
-            if d < 2:
-                continue
-            m = np.sort(np.fromiter((surv_pos[t] for t in simps_v),
-                                    dtype=np.int64, count=d))
-            npairs_v = d * (d - 1) // 2
-            if node_pair_cap is not None and npairs_v > node_pair_cap:
-                # ── per-node candidate-pair budget ──────────────────────────────────────
-                # A hub node of survivor-degree d contributes C(d,2) pairs;
-                # nodes over node_pair_cap contribute a seeded uniform
-                # subsample instead. Subsampling can only miss candidate
-                # merges, never execute unsound ones.
-                rng = np.random.default_rng(
-                    zlib.crc32(repr(v).encode('utf8', 'replace')))
-                a = rng.integers(0, d, size=2 * node_pair_cap)
-                b = rng.integers(0, d, size=2 * node_pair_cap)
-                lo = np.minimum(a, b); hi = np.maximum(a, b)
-                ok = lo < hi
-                lo, hi = lo[ok], hi[ok]
-                # dedupe within this node: an intra-node duplicate would
-                # inflate the pair's shared-node count `it` below
-                uniq = np.unique(lo * d + hi)
-                ti, tj = uniq // d, uniq % d
+    def plan(self, a, b):
+        """Exact delta-L for merging a and b; returns (delta, T, hist)."""
+        u = a | b
+        T = {a, b}
+        T.update(self.sub_objects(a))
+        T.update(self.sub_objects(b))
+        T.update(self.cross_objects(a, b))
+        if u not in T and u in self.faces:   # u already exists as a live H edge
+            T.add(u)
+            T.update(self.sub_objects(u))
+        N = self.N
+        hist = Counter()
+        dH = Counter()
+        dS = Counter()
+        d = 0.0
+        for t in T:
+            hist.update(self.hist[t])
+            if t in self.simp:
+                dS[len(t)] -= 1
+                d -= self.simp[t]
             else:
-                ti, tj = np.triu_indices(d, 1)
-            chunks_i.append(m[ti]); chunks_j.append(m[tj])
-            chunks_w.append(np.full(ti.shape, float(deg.get(v, 0))))
-        if chunks_i:
-            pi = np.concatenate(chunks_i); pj = np.concatenate(chunks_j)
-            pw = np.concatenate(chunks_w)
-            codes = pi * S0 + pj
-            ucodes, inv, it = np.unique(codes, return_inverse=True,
-                                        return_counts=True)
-            dsInt = np.bincount(inv, weights=pw, minlength=len(ucodes))
-            ii = (ucodes // S0).astype(np.int64)
-            jj = (ucodes % S0).astype(np.int64)
-            u = n_arr[ii] + n_arr[jj] - it
-            C0 = LCNu[u] - LCNu[n_arr[ii]] - LCNu[n_arr[jj]]
-            U1 = Utab[ii, u]
-            U2 = Utab[jj, u]
-            cc = np.minimum(ds[ii] - dsInt, ds[jj] - dsInt)
-            base = -oS[ii] - oS[jj] - nN[ii] - nN[jj] + oN[ii] + oN[jj]
-            if _sp:
-                # exact size-prior contribution (same for bound and delta)
-                base = base + u - spn[ii] - spn[jj]
-            # sound generic bound: sharedU <= min(U1, U2); cross charge bounded
-            # by the allowance terms
-            sxa = np.minimum(sx[ii], sx[jj])
-            allow = np.minimum(np.maximum(cc, 0) * maxdec[u], sxa)
-            bound = C0 + np.maximum(U1, U2) + base - allow
-            # ── single-overlap seeding restriction ──────────────────────────────────
-            # For |s1 & s2| == 1 the delta decomposes into exactly computable
-            # per-simplex terms plus the cross-edge credit; seed only if the
-            # exact part alone is negative (the credit remains available at
-            # every re-evaluation).
-            l1 = it == 1
-            if l1.any():
-                excl_l1 = C0 + U1 + U2 + base
-                bound = np.where(l1, excl_l1, bound)
-            keep = bound < 0
-            ki, kj, kb = ii[keep], jj[keep], bound[keep]
-            # ── per-object candidate budget ─────────────────────────────────────────
-            # Each object enters the heap with at most hub_cap candidates,
-            # ranked by the sound lower bound; a pruned pair re-enters via
-            # post-merge re-pairing as soon as either participant changes.
-            if len(ki) > 0:
-                def _group_ranks(g, b):
-                    o = np.lexsort((np.arange(len(g)), b, g))
-                    gs = g[o]
-                    starts = np.flatnonzero(
-                        np.concatenate(([True], gs[1:] != gs[:-1])))
-                    grp = np.zeros(len(g), dtype=np.int64)
-                    grp[starts] = 1
-                    grp = np.cumsum(grp) - 1
-                    first = starts[grp]
-                    r = np.empty(len(g), dtype=np.int64)
-                    r[o] = np.arange(len(g)) - first
-                    return r
-                r_i = _group_ranks(ki, kb)
-                r_j = _group_ranks(kj, kb)
-                keep2 = (r_i < hub_cap) | (r_j < hub_cap)
-                ki, kj = ki[keep2], kj[keep2]
-            # exact evaluation in the deterministic order of the direct
-            # double loop
-            o = np.lexsort((kj, ki))
-            ki, kj = ki[o], kj[o]
-            for _ci in range(len(ki)):
-                if (_seed_deadline is not None and (_ci & 2047) == 0
-                        and time.time() > _seed_deadline):
-                    if logfile:
-                        logfile.write("BUDGET: seeding truncated at %d/%d "
-                                      "candidates\n" % (_ci, len(ki)))
-                    break
-                _push(surv[ki[_ci]], surv[kj[_ci]])
+                dH[len(t)] -= 1
+        nu = len(u)
+        dS[nu] += 1
+        nest = self.nestc.get(u)
+        if nest is None:
+            nest = self.nest_for(a, b, u, T, hist)
+        d += set_local_cost(nu, hist, nest)
+        for j, c in dH.items():
+            if c:
+                h0 = self.Hc[j]
+                d += _lcc(N, j, h0 + c) - _lcc(N, j, h0)
+        for j, c in dS.items():
+            if c:
+                s0 = self.Sc[j]
+                d += _lcc(N, j, s0 + c) - _lcc(N, j, s0)
+        return d, T, (hist, nest)
 
-    itr = 0
-    n_pops = 0
-    _no_l1_repair = False
-    _budget_stage = 0
-    _rng_sto = random.Random(0)
-    while heap:
-        d, s1, s2 = heapq.heappop(heap)
-        n_pops += 1
-        # ── optional two-stage wall-clock budget ────────────────────────────────
-        # stage 1: tighten the candidate knobs (restriction-only);
-        # stage 2: stop merging and finalize the best decomposition found.
-        if budget_s is not None and n_pops % 1000 == 0 \
-                and time.time() - _t_start > budget_s:
-            if _budget_stage == 0:
-                if theta == 0.0:
-                    theta = 1.0
-                hub_cap = max(1, hub_cap // 2)
-                _no_l1_repair = True
-                _budget_stage = 1
-                budget_s = 2 * budget_s   # stage-2 deadline (from start)
-                if logfile:
-                    logfile.write("BUDGET stage 1: theta=1, hub_cap halved, "
-                                  "overlap-1 re-pairing disabled\n")
+    def apply(self, u, T, hn):
+        """Execute a planned merge; returns an undo record. The face set and
+        owner box of the operand with the most faces are reused (stolen),
+        so the cost is proportional to the smaller operands."""
+        hist, nest = hn
+        self.nestc[u] = nest
+        faces, idx, home = self.faces, self.idx, self.home
+        big = max(T, key=lambda t: (len(faces[t]), _enclosing_key(t)))
+        rec = []
+        for t in T:
+            rec.append((t, None if t is big else faces[t], self.hist[t],
+                        self.simp.get(t), self.box[t]))
+            if t in self.simp:
+                self.Sc[len(t)] -= 1
+                del self.simp[t]
+                for v in t:
+                    self.sidx[v].discard(t)
             else:
-                _budget_stage = 2
-                if logfile:
-                    logfile.write("BUDGET stage 2: merge loop stopped; "
-                                  "finalizing best-found decomposition\n")
-                break
-        key = frozenset({s1, s2})
-        if key not in valid or valid[key] != d:   # stale heap entry
-            continue
-        if d >= 0:
-            break                                  # no beneficial merge left
-        # minimum-improvement threshold (approx mode, decaying); rejected
-        # entries are dropped (restriction only)
-        if theta > 0.0 and d >= -(theta / (1.0 + itr)):
-            valid.pop(key, None)
-            s_pairs.get(s1, set()).discard(key)
-            s_pairs.get(s2, set()).discard(key)
-            continue
-        if s1 not in sfm or s2 not in sfm:
-            continue
-
-        union = s1 | s2
-        u = len(union)
-        if size_cap is not None and u > size_cap:
-            # giant-simplex guard (approx mode): skip merges whose union would
-            # exceed size_cap
-            valid.pop(key, None)
-            s_pairs.get(s1, set()).discard(key)
-            s_pairs.get(s2, set()).discard(key)
-            continue
-
-        # ── build the union's state incrementally (steal the larger set) ──
-        _ns1, _ns2 = len(s1), len(s2)
-        _il = len(s1 & s2)
-        cross = _cross_terms(s1, s2, _ns1 - _il, _ns2 - _il)
-        nsm, nbg = nested[s1], nested[s2]
-        s_small, s_big = (s1, s2) if len(nsm) <= len(nbg) else (s2, s1)
-        if len(nsm) > len(nbg):
-            nsm, nbg = nbg, nsm
-        hist_u = histN[s_big]
-        shared_sizes = Counter()
-        for e in nsm:
-            if e in nbg:
-                shared_sizes[len(e)] += 1
-        nested_u = nbg                       # steal
-        nested_u.update(nsm)
-        nested_u.update(cross)
-        hist_u = hist_u + histN[s_small] - shared_sizes
-        for e in cross:
-            hist_u[len(e)] += 1
-        crossN_sum = sum(_logchoose(N, len(e)) for e in cross)
-        sharedN_sum = sum(c * _logchoose(N, j) for j, c in shared_sizes.items())
-        nestN_u = nestN_c[s1] + nestN_c[s2] - sharedN_sum + crossN_sum
-        inter_nodes = [v for v in (s1 if len(s1) <= len(s2) else s2)
-                       if v in (s2 if len(s1) <= len(s2) else s1)]
-        degsum_u = degsum[s1] + degsum[s2] - sum(deg.get(v, 0) for v in inter_nodes)
-        sxc_u = sxc[s1] + sxc[s2] - sum(nodeCrossN.get(v, 0.0) for v in inter_nodes)
-
-        # remove merged simplices from all data structures
-        _invalidate(s1); _invalidate(s2)
-        light_u = nbrs.pop(s1, set()) if s1 != union else set(nbrs.get(s1, ()))
-        light_2 = nbrs.pop(s2, set()) if s2 != union else set(nbrs.get(s2, ()))
-        if len(light_u) < len(light_2):
-            light_u, light_2 = light_2, light_u
-        light_u.update(light_2)
-        light_u.discard(s1); light_u.discard(s2); light_u.discard(union)
-        if s1 != union:
-            del sfm[s1]
-        if s2 != union:
-            del sfm[s2]
-        for dd in (nested, histN, nestN_c, ownN_c, ownSelf_c, degsum, sxc):
-            if s1 != union:
-                dd.pop(s1, None)
-            if s2 != union:
-                dd.pop(s2, None)
-
-        # incremental simplex_index maintenance: retire the operands...
-        for op in (s1, s2):
-            if op != union:
-                for v in op:
-                    simplex_index[v].discard(op)
-
-        # register the union (owned == nested for merge-born simplices)
-        sfm[union] = nested_u
-        nested[union] = nested_u
-        histN[union] = hist_u
-        nestN_c[union] = nestN_u
-        ownN_c[union] = nestN_u
-        ownSelf_c[union] = sum(c * _logchoose(u, j) for j, c in hist_u.items())
-        degsum[union] = degsum_u
-        sxc[union] = sxc_u
-        s_pairs.setdefault(union, set())
-        hn_u = hnodes.pop(s1, frozenset()) | hnodes.pop(s2, frozenset())
-        hnodes[union] = hn_u
-        # ...and index the union
-        for v in union:
-            simplex_index[v].add(union)
-
-        # heavy-node neighbors resolved on demand from the live index
-        heavy_live = set()
-        for v in hn_u:
-            heavy_live |= simplex_index.get(v, set())
-        heavy_live.discard(union)
-
-        cand_all = light_u | heavy_live
-
-        # remove simplices now strictly nested inside the union
-        nested_simps = [k for k in cand_all if k in sfm and k < union]
-        for k in nested_simps:
-            _invalidate(k)
-            del sfm[k]
-            _drop_state(k)
-            nbrs.pop(k, None)
-            hnodes.pop(k, None)
-            for v in k:
-                simplex_index[v].discard(k)
-            cand_all.discard(k)
-            light_u.discard(k)
-
-        itr += 1
-        if logfile:
-            logfile.write(f"Phase2 iter {itr}: |{len(s1)}|+|{len(s2)}|->|{u}|  delta={d:.3f}\n")
-
-        # register the union's light neighbors and mirror it into theirs
-        light_live = [x for x in light_u if x in sfm]
-        nbrs[union] = set(light_live)
-        for x in light_live:
-            nbrs.setdefault(x, set()).add(union)
-
-        # post-merge re-pairing, with the same single-overlap restriction
-        # as seeding
-        live = [x for x in cand_all if x in sfm]
-        live_sorted = sorted(live, key=_ckey)
-        # per-union re-pairing budget: both candidate classes (overlap >= 2
-        # and single-overlap) are subsampled to hub_cap when larger;
-        # re-pairing recurs at every merge
-        _l1_c, _ge2_c = [], []
-        for s_other in live_sorted:
-            small_op = s_other if len(s_other) <= u else union
-            big_op = union if small_op is s_other else s_other
-            ov = 0
-            for v in small_op:
-                if v in big_op:
-                    ov += 1
-                    if ov > 1:
-                        break
-            if ov == 0:
+                self.Hc[len(t)] -= 1
+            del self.hist[t]
+            for v in t:
+                idx[v].discard(t)
+            home[self._rare(t)].discard(t)
+        bigfaces = faces.pop(big)
+        bigbox = self.box.pop(big)
+        for t in T:
+            if t is big:
                 continue
-            (_l1_c if ov == 1 else _ge2_c).append(s_other)
-        if _no_l1_repair:
-            _l1_c = []
-        if len(_ge2_c) > hub_cap:
-            _ge2_c = _rng_sto.sample(_ge2_c, hub_cap)
-        if len(_l1_c) > hub_cap:
-            _l1_c = _rng_sto.sample(_l1_c, hub_cap)
-        for s_other in _ge2_c:
-            _push(union, s_other)
-        for s_other in _l1_c:
-            if _l1_seed_excluded(union, s_other):
-                # clear any stale entry for this key
-                key = frozenset({union, s_other})
-                if valid.pop(key, None) is not None:
-                    s_pairs.get(union, set()).discard(key)
-                    s_pairs.get(s_other, set()).discard(key)
-                continue
-            _push(union, s_other)
+            f = faces.pop(t)
+            del self.box[t]
+            bigfaces |= f
+            obox = self.obox
+            for e in f:
+                obox[e] = bigbox
+        bigbox[0] = u
+        faces[u] = bigfaces
+        self.box[u] = bigbox
+        home[self._rare(u)].add(u)
+        self.hist[u] = hist
+        self.simp[u] = set_local_cost(len(u), hist, self.nestc[u])
+        self.Sc[len(u)] += 1
+        for v in u:
+            idx[v].add(u)
+            self.sidx[v].add(u)
+        return (u, big, rec)
 
-        # ── heap hygiene: purge stale tuples when they dominate ─────────
-        if len(heap) > max(4 * len(valid), 1024):
-            heap = [(dv, k1, k2) for k, dv in valid.items()
-                    for k1, k2 in [tuple(sorted(k, key=_ckey))]]
-            heapq.heapify(heap)
+    def undo(self, record):
+        u, big, rec = record
+        faces, idx, home = self.faces, self.idx, self.home
+        self.Sc[len(u)] -= 1
+        del self.simp[u]
+        bigfaces = faces.pop(u)
+        bigbox = self.box.pop(u)
+        del self.hist[u]
+        for v in u:
+            idx[v].discard(u)
+            self.sidx[v].discard(u)
+        home[self._rare(u)].discard(u)
+        for t, f, hist, cost, tbox in rec:
+            if t is not big:
+                bigfaces -= f
+                faces[t] = f
+                self.box[t] = tbox
+                for e in f:
+                    self.obox[e] = tbox
+        bigbox[0] = big
+        faces[big] = bigfaces
+        self.box[big] = bigbox
+        for t, f, hist, cost, tbox in rec:
+            home[self._rare(t)].add(t)
+            self.hist[t] = hist
+            if cost is None:
+                self.Hc[len(t)] += 1
+            else:
+                self.simp[t] = cost
+                self.Sc[len(t)] += 1
+                for v in t:
+                    self.sidx[v].add(t)
+            for v in t:
+                idx[v].add(t)
 
-    # record budget outcome for callers
-    last_run_info['budget_stage'] = _budget_stage
-    last_run_info['n_pops'] = n_pops
-    last_run_info['n_merges'] = itr
-    return {s: frozenset(faces) for s, faces in sfm.items()}
+    def total(self):
+        return sum(self.simp.values()) + set_global_cost(self.N, self.Hc, self.Sc)
 
 
-def greedy_optimizer(G_list, logpath='/dev/null', N=None, mode='auto',
-                     pair_cap=5_000_000, edge_cap=2_000_000,
-                     hub_cap=None, size_cap=None,
-                     lsh_num_perm=None, lsh_threshold=None,
-                     stochastic_eps=0.0, theta=0.0, budget_s=None,
-                     node_pair_cap='auto', seed_mem_cap=None):
-    """Two-phase greedy MDL optimizer. Returns (S, H, DL, eta).
+def set_greedy(G_frozen, N, node_pair_cap=None, hub_cap=None, budget_s=None,
+               logfile=None, seed=0, nucleation_cap=2000, nucleation_bits=64.0,
+               max_rounds=4):
+    """Exact greedy for the set-code objective. Returns (S, L_state).
 
-    N defaults to the number of distinct nodes in G_list; pass an
-    explicit N to embed G_list in a larger ambient system.
-    mode: 'exact' (exhaustive candidate seeding), 'approx' (MinHash-LSH
-    seeding with per-hub caps), or 'auto' (use 'approx' only when the
-    estimated memory footprint of exact seeding exceeds seed_mem_cap).
-    Resource arguments left at None resolve to the module-level
-    constants; budget_s optionally imposes a two-stage wall-clock
-    budget.
-    """
+    Phase 1 absorbs nested hyperedges collectively into their largest
+    enclosing hyperedge. Phase 2 runs lazy best-first pair merges. Each
+    phase ends with a NUCLEATION pass. Because S and H are coded as sets,
+    the cost of a new simplex falls as more simplices of its size exist,
+    so several moves can be jointly favourable while each is individually
+    unfavourable (e.g. two disjoint triangles in a tiny graph). The pass
+    applies the best near-miss candidates (delta < nucleation_bits) in
+    ascending order of delta, re-scoring each one exactly. It keeps the
+    prefix with the lowest cumulative L and undoes the rest, so it can
+    only lower L. Rounds repeat until nothing improves (max_rounds)."""
+    if node_pair_cap is None or node_pair_cap == 'auto':
+        node_pair_cap = NODE_PAIR_CAP
     if hub_cap is None:
         hub_cap = HUB_CAP
-    if lsh_num_perm is None:
-        lsh_num_perm = LSH_NUM_PERM
-    if lsh_threshold is None:
-        lsh_threshold = LSH_THRESHOLD
-    if seed_mem_cap is None:
-        seed_mem_cap = SEED_MEM_CAP
-    if node_pair_cap == 'auto':
-        node_pair_cap = NODE_PAIR_CAP
+    t0 = time.time()
+    deadline = t0 + budget_s if budget_s else None
+    st = _SetState(G_frozen, N)
+    L = st.total()
+    rng = random.Random(seed)
+    _kc = {}
+
+    def _key(t):
+        k = _kc.get(t)
+        if k is None:
+            k = _kc[t] = (len(t), tuple(sorted(map(str, t))))
+        return k
+    TOL = 1e-9
+    # A popped candidate whose re-scored delta is within STALE_SLACK bits of
+    # the next heap entry is executed rather than re-queued. Every move
+    # is still scored exactly; this only relaxes the best-first ORDER, so
+    # global-count drift cannot set off a re-queue cascade.
+    STALE_SLACK = 1.0
+
+    def log(msg):
+        if logfile:
+            logfile.write(msg + f"  [{time.time() - t0:.1f}s]\n")
+            logfile.flush()
+
+    def nucleate(cands, label):
+        """cands: iterable of (delta, a, b). Returns the L change (<= 0)."""
+        cands = sorted((c for c in cands if c[0] < nucleation_bits),
+                       key=lambda c: (c[0], _key(c[1]), _key(c[2])))[:nucleation_cap]
+        undo_log, cum, best, best_len = [], 0.0, 0.0, 0
+        for _, a, b in cands:
+            if a not in st.faces or b not in st.faces:
+                continue
+            d, T, hist = st.plan(a, b)
+            if not math.isfinite(d) or d >= nucleation_bits:
+                continue
+            undo_log.append(st.apply(a | b, T, hist))
+            cum += d
+            if cum < best - TOL:
+                best, best_len = cum, len(undo_log)
+        for rec in reversed(undo_log[best_len:]):
+            st.undo(rec)
+        if best_len:
+            log(f"  nucleation ({label}): {best_len} joint moves, dL={best:.3f}")
+        return best
+
+    # ── phase 1: collective absorption into the largest enclosing edges ────
+    def phase1():
+        dL, near, n = 0.0, [], 0
+        for p in sorted(G_frozen, key=lambda t: (-len(t), _key(t)[1])):
+            if p not in st.faces or p in st.simp or not st.desc.get(p):
+                continue
+            if not st.sub_objects(p):
+                continue
+            d, T, hist = st.plan(p, p)
+            if d < -TOL:
+                st.apply(p, T, hist)
+                dL += d
+                n += 1
+            elif d < nucleation_bits:
+                near.append((d, p, p))
+        log(f"set-code phase 1: {n} absorptions, |S|={len(st.simp)}")
+        return dL, near
+
+    # ── phase 2: lazy best-first pair merges ────────────────────────────────
+    def phase2():
+        heap, near = [], []
+        cnt = 0
+        partners = defaultdict(set)
+
+        def push(a, b):
+            nonlocal cnt
+            d, _, _ = st.plan(a, b)
+            if d < -TOL:
+                cnt += 1
+                heapq.heappush(heap, (d, cnt, a, b))
+                partners[a].add(b)
+                partners[b].add(a)
+            elif d < nucleation_bits:
+                near.append((d, a, b))
+
+        seen = set()
+        for v in sorted(st.idx, key=str):
+            objs = sorted(st.idx[v], key=_key)
+            d_ = len(objs)
+            if d_ < 2:
+                continue
+            if d_ * (d_ - 1) // 2 > node_pair_cap:
+                r = random.Random(zlib.crc32(repr(v).encode('utf8', 'replace')))
+                pairs = set()
+                while len(pairs) < node_pair_cap:
+                    i, k = r.randrange(d_), r.randrange(d_)
+                    if i != k:
+                        pairs.add((min(i, k), max(i, k)))
+                pairs = sorted(pairs)
+            else:
+                pairs = [(i, k) for i in range(d_) for k in range(i + 1, d_)]
+            n_eval = len(seen)
+            if n_eval // 200000 != (n_eval + len(pairs)) // 200000:
+                log(f"  seeding: {n_eval} pairs evaluated, heap={len(heap)}")
+            for i, k in pairs:
+                a, b = objs[i], objs[k]
+                key = (a, b) if _key(a) <= _key(b) else (b, a)
+                if key in seen:
+                    continue
+                seen.add(key)
+                push(a, b)
+            if deadline and time.time() > deadline:
+                log("BUDGET: seeding truncated")
+                break
+        seen = None
+
+        dL, n2 = 0.0, 0
+        while heap:
+            if deadline and time.time() > deadline:
+                log("BUDGET: phase 2 stopped early")
+                break
+            _, _, a, b = heapq.heappop(heap)
+            if a not in st.faces or b not in st.faces:
+                continue
+            d, T, hist = st.plan(a, b)
+            if d >= -TOL:
+                if d < nucleation_bits:
+                    near.append((d, a, b))
+                continue
+            if heap and d > heap[0][0] + STALE_SLACK:   # stale: re-queue at its true value
+                cnt += 1
+                heapq.heappush(heap, (d, cnt, a, b))
+                continue
+            u = a | b
+            old_partners = set()
+            for t in T:
+                old_partners |= partners.pop(t, set())
+            st.apply(u, T, hist)
+            dL += d
+            n2 += 1
+            if n2 % 2000 == 0:
+                log(f"  phase 2: {n2} merges, |S|={len(st.simp)}, heap={len(heap)}, "
+                    f"max|s|={len(u)}")
+            # re-pair: earlier partners of the absorbed objects, plus the
+            # neighbours of u with the largest overlap (capped at hub_cap)
+            cand = {t for t in old_partners if t in st.faces and t != u}
+            big_op = max(T, key=len)
+            new_nodes = set()
+            for t in T:
+                if t is not big_op:
+                    new_nodes.update(v for v in t if v not in big_op)
+            ov = Counter()
+            scanned = 0
+            scan = sorted(new_nodes, key=str)
+            if len(big_op) <= 64:
+                scan += sorted(big_op, key=str)
+            for v in scan:
+                for t in st.idx[v]:
+                    if t is not u:
+                        ov[t] += 1
+                scanned += len(st.idx[v])
+                if scanned > 50 * hub_cap:
+                    break
+            cand.update(sorted(ov, key=lambda t: (-ov[t], _key(t)))[:hub_cap])
+            if len(cand) > hub_cap:     # per-union re-pairing budget
+                cand = set(sorted(cand, key=lambda t: (-ov.get(t, 0), _key(t)))[:hub_cap])
+            for t in sorted(cand, key=_key):
+                push(u, t)
+        log(f"set-code phase 2: {n2} merges, |S|={len(st.simp)}")
+        return dL, near
+
+    for rnd in range(max_rounds):
+        L_start = L
+        d1, near1 = phase1()
+        L += d1
+        L += nucleate(near1, 'phase 1')
+        if deadline and time.time() > deadline:
+            break
+        d2, near2 = phase2()
+        L += d2
+        L += nucleate(near2, 'phase 2')
+        log(f"round {rnd + 1}: L={L:.3f}")
+        if L > L_start - 1e-6 or (deadline and time.time() > deadline):
+            break
+
+    chk = st.total()
+    if abs(chk - L) > 1e-6 * max(1.0, abs(L)):
+        raise RuntimeError(f"set-code bookkeeping drift: {L} vs {chk}")
+    return list(st.simp), chk
+
+
+def _set_greedy_optimizer(G_list, logpath=os.devnull, N=None, budget_s=None,
+                          node_pair_cap='auto', hub_cap=None, **_ignored):
     G_frozen = frozenset(frozenset(e) for e in G_list)
     if N is None:
-        N = len(set(node for e in G_frozen for node in e))
-    verbose_log = os.path.basename(logpath) != os.path.basename(os.devnull)
-    with open(logpath, "w") as lf:
-        lf.write(f"N={N}  E={len(G_frozen)}  L0={baseline_DL(G_frozen, N):.3f}\n\n")
-        lf.write("=== Phase 1 ===\n")
-        sfm = phase1(G_frozen, N, logfile=lf if verbose_log else None)
-        # ── complexity estimate and auto mode switch ────────────────────────────
-        deg_S = Counter(v for s_ in sfm for v in s_)
-        pair_est = sum(dd * (dd - 1) // 2 for dd in deg_S.values())
-        E_ = len(G_frozen)
-        dmax = max(deg_S.values(), default=0)
-        if node_pair_cap is not None:
-            # exact seeding materializes its pair arrays; estimate their memory
-            # footprint from the survivor degree histogram
-            S0_ = len(sfm)
-            nmax_ = max((len(s_) for s_ in sfm), default=0)
-            kmax_ = max((len(e) for e in G_frozen), default=0)
-            pairs_capped = sum(min(dd * (dd - 1) // 2, node_pair_cap)
-                               for dd in deg_S.values())
-            seed_mem_est = (24 * pairs_capped
-                            + 8 * S0_ * (kmax_ + 1)
-                            + 8 * S0_ * (2 * nmax_ + 1)) if S0_ >= 300 else 0
-            # escalation criterion: the estimated memory footprint alone decides
-            approx = (mode == 'approx') or (mode == 'auto' and
-                      seed_mem_est > seed_mem_cap)
-            trigger = ('forced' if mode == 'approx' else
-                       'seed_mem' if seed_mem_est > seed_mem_cap
-                       else None) if approx else None
-        else:
-            seed_mem_est = None
-            approx = (mode == 'approx') or (mode == 'auto' and
-                      (pair_est > pair_cap or E_ > edge_cap or dmax > 10 * hub_cap))
-            trigger = ('forced' if mode == 'approx' else
-                       'pair_est' if pair_est > pair_cap else
-                       'edge_cap' if E_ > edge_cap else
-                       'hub_deg' if dmax > 10 * hub_cap else None) if approx else None
-        last_run_info.clear()
-        last_run_info.update(mode='approx' if approx else 'exact',
-                             requested_mode=mode, pair_est=pair_est, E=E_,
-                             S0=len(sfm), dmax=dmax, trigger=trigger,
-                             hub_cap=hub_cap, size_cap=size_cap,
-                             node_pair_cap=node_pair_cap,
-                             seed_mem_est=seed_mem_est,
-                             lsh_num_perm=lsh_num_perm,
-                             lsh_threshold=lsh_threshold, theta=theta)
-        lf.write(f"mode={last_run_info['mode']} (requested {mode}; "
-                 f"pair_est={pair_est} E={E_} dmax={dmax} trigger={trigger})\n")
-        # diagnostic log only; skipped unless a real log file was requested
-        if verbose_log:
-            lf.write(f"After Phase 1: |S|={len(sfm)}  DL={description_length(G_frozen, list(sfm), N):.3f}\n\n")
-        else:
-            lf.write(f"After Phase 1: |S|={len(sfm)}\n\n")
-        lf.write("=== Phase 2 ===\n")
-        sfm = phase2(sfm, G_frozen, N, logfile=lf if verbose_log else None,
-                     approx=approx, hub_cap=hub_cap, size_cap=size_cap,
-                     lsh_num_perm=lsh_num_perm, lsh_threshold=lsh_threshold,
-                     stochastic_eps=stochastic_eps, theta=theta,
-                     budget_s=budget_s, node_pair_cap=node_pair_cap)
-        L0 = baseline_DL(G_frozen, N)
-        DL = description_length(G_frozen, list(sfm), N)
+        N = len(set(v for e in G_frozen for v in e))
+    t0 = time.time()
+    with open(logpath, 'w') as lf:
+        L0 = set_baseline_DL(G_frozen, N)
+        lf.write(f"[set code] N={N}  E={len(G_frozen)}  L0={L0:.3f}\n")
+        S, Lstate = set_greedy(G_frozen, N, node_pair_cap=node_pair_cap,
+                               hub_cap=hub_cap, budget_s=budget_s, logfile=lf)
+        DL = set_description_length(G_frozen, S, N)
+        lf.write(f"state L={Lstate:.3f}  assignment-rule L={DL:.3f}\n")
         if DL >= L0:
-            sfm = {}; DL = L0
-        lf.write(f"Final: |S|={len(sfm)}  DL={DL:.3f}\n")
-    return _finalise(G_frozen, list(sfm), DL, L0)
+            S, DL = [], L0
+        lf.write(f"Final: |S|={len(S)}  DL={DL:.3f}  eta={DL / L0:.4f}\n")
+    last_run_info.clear()
+    last_run_info.update(mode='set-exact', objective='set', requested_mode='exact',
+                         E=len(G_frozen), S0=len(S), trigger=None,
+                         node_pair_cap=node_pair_cap, hub_cap=hub_cap,
+                         runtime_s=time.time() - t0)
+    return _finalise(G_frozen, S, DL, L0)
+
+
+
+
+greedy_optimizer = _set_greedy_optimizer
+description_length = set_description_length
+baseline_DL = set_baseline_DL
 
 
 # ── convenience wrapper ──────────────────────────────────────────────────────

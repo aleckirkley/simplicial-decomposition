@@ -4,11 +4,19 @@ Parameter-free decomposition of a hypergraph into its **simplicial
 component** — a set of latent simplices whose observed faces are more
 parsimoniously described as fragments of coherent group interactions —
 and a **residual** of independent hyperedges. The method minimizes a
-description length derived from a Bayesian generative model.
+description length derived from a Bayesian generative model (equivalently,
+performs maximum-a-posteriori inference) and has no tunable parameters.
+
+Companion code for:
+
+> A. Kirkley and F. Battiston, *When are hypergraphs simplicial?*
+> (2026). [journal / arXiv link]
 
 ## Contents
 
-- `simplicial_decomposition.py` — the complete algorithm for running the decomposition.
+- `simplicial_decomposition.py` — the complete algorithm in one file,
+  extracted verbatim from the code used for every result in the paper.
+  It needs only the Python standard library (Python >= 3.9).
 - `reproduce_fig1.py` — reproduces the paper's Fig. 1 example:
   decomposes a small synthetic hypergraph and prints the observed
   hypergraph, the inferred simplices with their hosted hyperedges, the
@@ -45,12 +53,31 @@ Each inferred simplex `s` is a claim that the hyperedges nested inside
 it are better explained as noisy observations of one latent group
 interaction on `s`'s nodes than as independent interactions. The
 compression ratio `eta` in (0, 1] summarizes how much simplicial
-structure the data contain (lower = more).
+structure the data contain (lower = more); `eta = 1` means the method
+found no evidence of simplicial structure and returned the null
+decomposition. The null description is the code of a uniformly random
+hypergraph with the observed numbers of hyperedges of each size, so
+random hypergraphs give `eta = 1`: the method abstains rather than
+hallucinating structure on random data.
+
+Because the null is uniform over nodes, strongly heterogeneous node
+degrees alone can produce mild compression (for example, a large
+"simplex" of high-degree nodes). To separate simplicial structure from
+degree effects, compare `eta` with its value on a degree-preserving
+randomization of your data, e.g. one obtained by shuffling node
+incidences across hyperedges while keeping hyperedge sizes fixed.
 
 ## Scaling
 
-The file includes the paper's three resource budgets (a per-node
-candidate-pair budget, a per-object candidate budget, and a memory
-bound under which candidate seeding switches to a MinHash-LSH
-generator, implemented in numpy), allowing for easy scalability to very large systems 
+The file includes the paper's two resource budgets: a per-node
+candidate-pair budget (`SD_NODE_PAIR_CAP`, default 1000) and a
+per-object re-pairing budget (`SD_HUB_CAP`, default 100), both
+settable as environment variables. Neither engages on small or moderate
+data, and with them the method has been run on hypergraphs with close to
+10^6 hyperedges. Every move is scored by its exact change in description
+length, so the budgets can only omit candidate merges and never apply an
+unsound one. Results are deterministic.
 
+## Citing
+
+If you use this code, please cite the paper above.
