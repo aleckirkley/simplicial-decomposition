@@ -73,6 +73,3 @@ data, and with them the method has been run on hypergraphs with close to
 length, so the budgets can only omit candidate merges and never apply an
 unsound one. Results are deterministic.
 
-## Citing
-
-If you use this code, please cite the paper above.
